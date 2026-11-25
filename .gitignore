@@ -1,0 +1,34 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Testing and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated captures and exports
+*.pcap
+*.pcapng
+*.cap
+*_flows.json
+
+# Environment and IDE
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
