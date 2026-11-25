@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TrafficScope — Cyber SOC Packet Analyzer</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+  <script src="/static/js/dashboard.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top SOC Header & Zero-CLI Command Bar -->
+    <header class="soc-header">
+      <div class="brand-bar">
+        <div class="brand-left">
+          <div class="brand-logo" aria-hidden="true">TS</div>
+          <div>
+            <h1 class="brand-title">TrafficScope <span class="brand-tag">SOC</span></h1>
+            <p class="brand-subtitle" id="source-label">Idle — Select interface or PCAP file</p>
+          </div>
+        </div>
+        <div class="status-cluster">
+          <span class="pill pill-neutral" id="mode-pill">
+            <span class="status-dot" id="status-dot"></span>
+            <span id="mode-text">IDLE</span>
+          </span>
+          <span class="pill pill-neutral" id="elevation-pill">CHECKING</span>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-refresh-ifaces" title="Refresh network interfaces">
+            Refresh NICs
+          </button>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-toggle-advanced" aria-expanded="false">
+            Tuning &amp; Privacy
+          </button>
+        </div>
+      </div>
+
+      <!-- Primary Action Controls -->
+      <div class="control-deck">
+        <div class="control-group control-grow">
+          <label for="iface-select" class="field-label">Network Interface</label>
+          <select id="iface-select" class="input-control">
+            <option value="">Loading interfaces...</option>
+          </select>
+        </div>
+
+        <div class="control-group control-grow">
+          <label for="bpf-input" class="field-label">BPF Capture Filter (optional)</label>
+          <input id="bpf-input" type="text" class="input-control mono" placeholder="e.g. tcp port 80 or port 443">
+        </div>
+
+        <div class="control-actions">
+          <button type="button" class="btn btn-primary" id="btn-start-live">
+            Start Live Capture
+          </button>
+          <button type="button" class="btn btn-danger" id="btn-stop" disabled>
+            Stop
+          </button>
+          <button type="button" class="btn btn-secondary" id="btn-replay-upload">
+            Replay .PCAP
+          </button>
+          <input id="pcap-file-input" type="file" accept=".pcap,.pcapng,.cap" hidden>
+          <a class="btn btn-ghost disabled-link" id="btn-export-pcap" href="/api/export/pcap" aria-disabled="true">
+            Export PCAP
+          </a>
+          <div class="export-combo">
+            <select id="export-format-select" class="input-control export-select" aria-label="Select export format">
+              <optgroup label="JSON Formats">
+                <option value="/api/export/report">Full SOC Report (.json)</option>
+                <option value="/api/export/flows">Flows Summary (.json)</option>
+              </optgroup>
+              <optgroup label="CSV Formats (Excel)">
+                <option value="/api/export/csv?kind=alerts">Security Alerts (.csv)</option>
+                <option value="/api/export/csv?kind=flows">Flows &amp; OS (.csv)</option>
+                <option value="/api/export/csv?kind=packets">Recent Packets (.csv)</option>
+              </optgroup>
+            </select>
+            <button type="button" class="btn btn-secondary" id="btn-export-selected" disabled>
+              Export
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Collapsible Privacy, Tuning & Local Path Replay Drawer -->
+      <section class="advanced-drawer hidden" id="advanced-drawer" aria-label="Capture Tuning and Privacy Options">
+        <div class="advanced-grid">
+          <div class="control-group">
+            <label for="opt-http-ports" class="field-label">HTTP Dissector Ports</label>
+            <input id="opt-http-ports" type="text" class="input-control mono" value="80,8080,3000,8000,8008">
+          </div>
+          <div class="control-group">
+            <label for="opt-threads" class="field-label">Worker Threads</label>
+            <input id="opt-threads" type="number" min="1" max="16" class="input-control mono" placeholder="Auto">
+          </div>
+          <div class="control-group">
+            <label for="opt-baseline" class="field-label">Anomaly Baseline (s)</label>
+            <input id="opt-baseline" type="number" min="1" max="3600" value="60" class="input-control mono">
+          </div>
+          <div class="control-group">
+            <label for="opt-count" class="field-label">Max Packets (optional)</label>
+            <input id="opt-count" type="number" min="1" class="input-control mono" placeholder="Unlimited">
+          </div>
+          <div class="control-group">
+            <label for="opt-payload-bytes" class="field-label">Payload Byte Cap</label>
+            <input id="opt-payload-bytes" type="number" min="1" max="65535" class="input-control mono" placeholder="Full payload">
+          </div>
+          <div class="control-group control-checkbox">
+            <label class="checkbox-label">
+              <input id="opt-no-payload" type="checkbox">
+              <span>Privacy Mode (--no-payload)</span>
+            </label>
+          </div>
+        </div>
+        <div class="local-replay-row">
+          <div class="control-group control-grow">
+            <label for="opt-local-pcap" class="field-label">Or Replay Local Server PCAP Path</label>
+            <input id="opt-local-pcap" type="text" class="input-control mono" placeholder="e.g. D:\captures\sample.pcap">
+          </div>
+          <button type="button" class="btn btn-secondary" id="btn-replay-path">
+            Load Local Path
+          </button>
+        </div>
+      </section>
+
+      <!-- Feedback Banner -->
+      <div class="alert-banner hidden" id="feedback-banner" role="alert">
+        <span id="feedback-text"></span>
+        <button type="button" class="banner-close" id="btn-close-banner" aria-label="Dismiss alert">&times;</button>
+      </div>
+    </header>
+
+    <!-- Main Dashboard Content -->
+    <main class="soc-main">
+      <!-- KPI Cards -->
+      <section class="kpi-grid" aria-label="Key Performance Metrics">
+        <article class="kpi-card">
+          <span class="kpi-label">Packets Processed</span>
+          <strong class="kpi-value mono" id="kpi-packets">0</strong>
+          <span class="kpi-meta mono" id="kpi-pps">0.0 pps (avg 0.0 / peak 0.0)</span>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Data Volume</span>
+          <strong class="kpi-value mono" id="kpi-bytes">0 B</strong>
+          <span class="kpi-meta mono" id="kpi-streams">0 TCP streams tracked</span>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Active Hosts / HTTP</span>
+          <strong class="kpi-value mono" id="kpi-hosts">0</strong>
+          <span class="kpi-meta mono" id="kpi-http">0 HTTP exchanges</span>
+        </article>
+        <article class="kpi-card kpi-alert-card" id="kpi-alert-box">
+          <span class="kpi-label">Security Anomalies</span>
+          <strong class="kpi-value mono" id="kpi-anomalies">0</strong>
+          <span class="kpi-meta mono" id="kpi-anomaly-types">No active threat triggers</span>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Capture Drops</span>
+          <strong class="kpi-value mono" id="kpi-drops">0</strong>
+          <span class="kpi-meta mono" id="kpi-kernel-drops">Kernel drops: n/a</span>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Session Duration</span>
+          <strong class="kpi-value mono" id="kpi-elapsed">00:00.0</strong>
+          <span class="kpi-meta" id="kpi-completion">Ready to capture</span>
+        </article>
+      </section>
+
+      <!-- Charts & Analytics Row -->
+      <section class="charts-grid" aria-label="Traffic Analytics Charts">
+        <article class="panel-card">
+          <div class="panel-head">
+            <h2>Throughput &amp; Threat Timeline (60s Window)</h2>
+            <span class="panel-caption mono" id="chart-rate-caption">Packets / sec &amp; Alerts</span>
+          </div>
+          <div class="chart-stage">
+            <canvas id="timeline-chart"></canvas>
+            <div class="fallback-chart hidden" id="timeline-fallback"></div>
+          </div>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-head">
+            <h2>Protocol Breakdown</h2>
+            <span class="panel-caption mono" id="proto-total-caption">0 pkts</span>
+          </div>
+          <div class="chart-stage chart-stage-sm">
+            <canvas id="protocol-chart"></canvas>
+            <div class="fallback-chart hidden" id="protocol-fallback"></div>
+          </div>
+          <ul class="legend-list mono" id="protocol-legend"></ul>
+        </article>
+
+        <article class="panel-card">
+          <div class="panel-head">
+            <h2>Entropy &amp; Top Hosts</h2>
+            <span class="panel-caption">Payload randomness + Passive OS</span>
+          </div>
+          <div class="entropy-bars" id="entropy-summary"></div>
+          <h3 class="subhead">Top Talkers</h3>
+          <div class="mini-host-list mono" id="top-hosts-list"></div>
+        </article>
+      </section>
+
+      <!-- Deep Inspection Tabs -->
+      <section class="panel-card" aria-label="Deep Packet &amp; Flow Inspector">
+        <div class="workbench-bar">
+          <div class="tabs-nav" role="tablist">
+            <button type="button" class="tab-btn active" role="tab" data-tab="packets" aria-selected="true">
+              Live Packets <span class="tab-count mono" id="badge-packets">0</span>
+            </button>
+            <button type="button" class="tab-btn" role="tab" data-tab="flows" aria-selected="false">
+              Flows &amp; OS <span class="tab-count mono" id="badge-flows">0</span>
+            </button>
+            <button type="button" class="tab-btn" role="tab" data-tab="alerts" aria-selected="false">
+              Security Alerts <span class="tab-count mono" id="badge-alerts">0</span>
+            </button>
+            <button type="button" class="tab-btn" role="tab" data-tab="metadata" aria-selected="false">
+              DNS &amp; TLS SNI <span class="tab-count mono" id="badge-meta">0</span>
+            </button>
+            <button type="button" class="tab-btn" role="tab" data-tab="http" aria-selected="false">
+              HTTP Sessions <span class="tab-count mono" id="badge-http">0</span>
+            </button>
+          </div>
+          <div class="workbench-tools">
+            <input id="search-input" type="search" class="input-control input-sm mono" placeholder="Filter IP, port, proto, domain...">
+          </div>
+        </div>
+
+        <!-- Tab 1: Live Packets -->
+        <div class="tab-panel active" id="tab-packets">
+          <div class="table-wrap">
+            <table class="soc-table mono">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Time</th>
+                  <th>Source</th>
+                  <th>Destination</th>
+                  <th>Proto</th>
+                  <th>Len</th>
+                  <th>Summary / Payload Info</th>
+                </tr>
+              </thead>
+              <tbody id="packets-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Tab 2: Flows & OS -->
+        <div class="tab-panel" id="tab-flows">
+          <div class="table-wrap">
+            <table class="soc-table mono">
+              <thead>
+                <tr>
+                  <th>Flow (Src &rarr; Dst)</th>
+                  <th>Proto</th>
+                  <th>Passive OS Fingerprint</th>
+                  <th>Pkts</th>
+                  <th>Bytes</th>
+                  <th>Duration</th>
+                  <th>Entropy</th>
+                  <th>Stream</th>
+                </tr>
+              </thead>
+              <tbody id="flows-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Tab 3: Security Alerts -->
+        <div class="tab-panel" id="tab-alerts">
+          <div class="severity-bar">
+            <span class="field-label">Severity Filter:</span>
+            <button type="button" class="chip active" data-sev="ALL">All</button>
+            <button type="button" class="chip" data-sev="HIGH">High</button>
+            <button type="button" class="chip" data-sev="MEDIUM">Medium</button>
+            <button type="button" class="chip" data-sev="LOW">Low</button>
+          </div>
+          <div class="table-wrap">
+            <table class="soc-table mono">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Severity</th>
+                  <th>Alert Type</th>
+                  <th>Source &rarr; Target</th>
+                  <th>Description</th>
+                </tr>
+              </thead>
+              <tbody id="alerts-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Tab 4: DNS & TLS Metadata -->
+        <div class="tab-panel" id="tab-metadata">
+          <div class="split-tables">
+            <div>
+              <h3 class="subhead">DNS Queries &amp; Responses</h3>
+              <div class="table-wrap table-wrap-compact">
+                <table class="soc-table mono">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Client</th>
+                      <th>Kind / Type</th>
+                      <th>Query &amp; Resolved IPs</th>
+                    </tr>
+                  </thead>
+                  <tbody id="dns-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3 class="subhead">TLS Handshakes &amp; SNI</h3>
+              <div class="table-wrap table-wrap-compact">
+                <table class="soc-table mono">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Client &rarr; Server</th>
+                      <th>Version / Ciphers</th>
+                      <th>SNI &amp; ALPN</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tls-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 5: HTTP Sessions -->
+        <div class="tab-panel" id="tab-http">
+          <div class="table-wrap">
+            <table class="soc-table mono">
+              <thead>
+                <tr>
+                  <th>Client &rarr; Server</th>
+                  <th>Request</th>
+                  <th>Host</th>
+                  <th>Status</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="http-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Wireshark-style Follow TCP Stream Modal -->
+  <div class="modal-backdrop hidden" id="stream-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="modal-title">Follow TCP Stream</h2>
+          <p class="mono modal-sub" id="modal-flow-label"></p>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-stream">Copy Transcript</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-close-modal">Close</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="modal-http-summary hidden" id="modal-http-summary"></div>
+        <div class="stream-transcript mono" id="stream-transcript"></div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
