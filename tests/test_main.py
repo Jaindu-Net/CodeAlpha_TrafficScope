@@ -11,6 +11,7 @@ from rich.console import Console
 from scapy.utils import rdpcap, wrpcap
 
 from main import build_arg_parser, main, run_session
+from pipeline import derive_flows_json_path, resolve_pcap_read_path, resolve_pcap_save_path
 from tests.conftest import (
     make_dns_query,
     make_http_request_pkt,
@@ -96,3 +97,23 @@ def test_analyzer_module_has_zero_forbidden_imports() -> None:
     for py_file in Path("analyzer").rglob("*.py"):
         found = _extract_top_level_imports(py_file)
         assert not (found & forbidden), f"{py_file}: forbidden imports {found & forbidden}"
+
+
+def test_default_output_folder_routing(tmp_path: Path) -> None:
+    pcap_dir = tmp_path / "output" / "pcap"
+    json_dir = tmp_path / "output" / "json"
+    saved = resolve_pcap_save_path("my_capture.pcap", pcap_dir=pcap_dir)
+    assert saved == pcap_dir / "my_capture.pcap"
+    assert derive_flows_json_path(saved, json_dir=json_dir, pcap_dir=pcap_dir) == (
+        json_dir / "my_capture_flows.json"
+    )
+
+    pcap_dir.mkdir(parents=True, exist_ok=True)
+    saved.write_bytes(b"stub")
+    assert resolve_pcap_read_path("my_capture.pcap", pcap_dir=pcap_dir) == saved
+
+    explicit = tmp_path / "custom" / "cap.pcap"
+    assert resolve_pcap_save_path(explicit, pcap_dir=pcap_dir) == explicit
+    assert derive_flows_json_path(explicit, json_dir=json_dir, pcap_dir=pcap_dir) == (
+        tmp_path / "custom" / "cap_flows.json"
+    )

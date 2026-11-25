@@ -19,7 +19,8 @@ build/
 .coverage
 htmlcov/
 
-# Generated captures and exports
+# Generated captures and exports (kept local, never pushed to GitHub)
+output/
 *.pcap
 *.pcapng
 *.cap
