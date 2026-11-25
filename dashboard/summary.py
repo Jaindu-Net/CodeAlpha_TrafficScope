@@ -12,15 +12,13 @@ from dashboard.widgets.top_talkers import format_bytes
 
 
 def _bar(fraction: float, width: int = 20) -> str:
-    """Render an ASCII/Unicode horizontal proportion bar."""
+    """Render a Unicode horizontal proportion bar."""
     filled = max(0, min(width, round(fraction * width)))
     return "█" * filled + "░" * (width - filled)
 
 
-def print_exit_report(stats: dict[str, Any], console: Console | None = None) -> None:
-    """Print TrafficScope capture summary, top IPs/ports, anomalies, and throughput."""
-    out = console or Console()
-
+def _render_overview(stats: dict[str, Any], out: Console) -> None:
+    """Render top-level session duration, volume, throughput, and drops panel."""
     elapsed = float(stats.get("elapsed_s", 0.0))
     total_pkts = int(stats.get("total_packets", 0))
     total_bytes = int(stats.get("total_bytes", 0))
@@ -46,66 +44,87 @@ def print_exit_report(stats: dict[str, Any], console: Console | None = None) -> 
     out.print()
     out.print(Panel(overview, title="TrafficScope Session Summary", border_style="cyan"))
 
-    # Protocol breakdown
-    proto_counts: dict[str, int] = stats.get("protocol_counts", {})
-    if proto_counts:
-        proto_table = Table(title="Protocol Breakdown")
-        proto_table.add_column("Protocol", style="bold cyan")
-        proto_table.add_column("Packets", justify="right")
-        proto_table.add_column("Share", justify="right")
-        proto_table.add_column("Distribution")
-        proto_total = sum(proto_counts.values()) or 1
-        for proto, cnt in sorted(proto_counts.items(), key=lambda x: x[1], reverse=True):
-            frac = cnt / proto_total
-            proto_table.add_row(proto, f"{cnt:,}", f"{frac * 100:5.1f}%", _bar(frac))
-        out.print(proto_table)
 
-    # Top IPs
-    top_hosts: list[dict[str, Any]] = stats.get("top_hosts", [])
-    if top_hosts:
-        host_table = Table(title="Top Talkers (IPs)")
-        host_table.add_column("IP Address", style="bold green")
-        host_table.add_column("Volume", justify="right")
-        host_table.add_column("Packets", justify="right")
-        host_table.add_column("Protocol")
-        host_table.add_column("OS Guess")
-        for host in top_hosts[:5]:
-            host_table.add_row(
-                str(host["ip"]),
-                format_bytes(int(host["bytes"])),
-                f"{int(host['packets']):,}",
-                str(host.get("protocol", "OTHER")),
-                str(host.get("os_guess") or "—"),
-            )
-        out.print(host_table)
+def _render_protocol_table(proto_counts: dict[str, int], out: Console) -> None:
+    """Render protocol packet counts and visual share bars."""
+    if not proto_counts:
+        return
+    table = Table(title="Protocol Breakdown")
+    table.add_column("Protocol", style="bold cyan")
+    table.add_column("Packets", justify="right")
+    table.add_column("Share", justify="right")
+    table.add_column("Distribution")
+    total = sum(proto_counts.values()) or 1
+    for proto, cnt in sorted(proto_counts.items(), key=lambda x: x[1], reverse=True):
+        frac = cnt / total
+        table.add_row(proto, f"{cnt:,}", f"{frac * 100:5.1f}%", _bar(frac))
+    out.print(table)
 
-    # Top Destination Ports
-    top_ports: list[tuple[int, int]] = stats.get("top_ports", [])
-    if top_ports:
-        port_table = Table(title="Top Ports")
-        port_table.add_column("Port", justify="right", style="yellow")
-        port_table.add_column("Packets", justify="right")
-        for port, cnt in top_ports[:5]:
-            port_table.add_row(str(port), f"{cnt:,}")
-        out.print(port_table)
 
-    # Anomaly Breakdown
-    anomaly_counts: dict[Any, int] = stats.get("anomaly_counts", {})
-    if anomaly_counts:
-        anom_table = Table(title="Anomalies by Type")
-        anom_table.add_column("Alert Type", style="bold red")
-        anom_table.add_column("Count", justify="right")
-        for atype, cnt in sorted(anomaly_counts.items(), key=lambda x: x[1], reverse=True):
-            label = atype.value if hasattr(atype, "value") else str(atype)
-            anom_table.add_row(label, f"{cnt:,}")
-        out.print(anom_table)
+def _render_top_hosts(top_hosts: list[dict[str, Any]], out: Console) -> None:
+    """Render top 5 host IPs by byte volume alongside passive OS guesses."""
+    if not top_hosts:
+        return
+    table = Table(title="Top Talkers (IPs)")
+    table.add_column("IP Address", style="bold green")
+    table.add_column("Volume", justify="right")
+    table.add_column("Packets", justify="right")
+    table.add_column("Protocol")
+    table.add_column("OS Guess")
+    for host in top_hosts[:5]:
+        table.add_row(
+            str(host["ip"]),
+            format_bytes(int(host["bytes"])),
+            f"{int(host['packets']):,}",
+            str(host.get("protocol", "OTHER")),
+            str(host.get("os_guess") or "—"),
+        )
+    out.print(table)
 
-    # Entropy summary
-    entropy_summary: dict[str, int] = stats.get("entropy_summary", {})
-    if any(entropy_summary.values()):
-        ent_table = Table(title="Flow Payload Entropy Summary")
-        ent_table.add_column("Classification", style="bold magenta")
-        ent_table.add_column("Flows", justify="right")
-        for label, cnt in entropy_summary.items():
-            ent_table.add_row(label, f"{cnt:,}")
-        out.print(ent_table)
+
+def _render_top_ports(top_ports: list[tuple[int, int]], out: Console) -> None:
+    """Render top 5 destination ports observed."""
+    if not top_ports:
+        return
+    table = Table(title="Top Ports")
+    table.add_column("Port", justify="right", style="yellow")
+    table.add_column("Packets", justify="right")
+    for port, cnt in top_ports[:5]:
+        table.add_row(str(port), f"{cnt:,}")
+    out.print(table)
+
+
+def _render_anomalies(anomaly_counts: dict[Any, int], out: Console) -> None:
+    """Render counts of detected anomalies grouped by AlertType."""
+    if not anomaly_counts:
+        return
+    table = Table(title="Anomalies by Type")
+    table.add_column("Alert Type", style="bold red")
+    table.add_column("Count", justify="right")
+    for atype, cnt in sorted(anomaly_counts.items(), key=lambda x: x[1], reverse=True):
+        label = atype.value if hasattr(atype, "value") else str(atype)
+        table.add_row(label, f"{cnt:,}")
+    out.print(table)
+
+
+def _render_entropy_summary(entropy_summary: dict[str, int], out: Console) -> None:
+    """Render counts of flows across Shannon entropy classification buckets."""
+    if not any(entropy_summary.values()):
+        return
+    table = Table(title="Flow Payload Entropy Summary")
+    table.add_column("Classification", style="bold magenta")
+    table.add_column("Flows", justify="right")
+    for label, cnt in entropy_summary.items():
+        table.add_row(label, f"{cnt:,}")
+    out.print(table)
+
+
+def print_exit_report(stats: dict[str, Any], console: Console | None = None) -> None:
+    """Print TrafficScope capture summary, top IPs/ports, anomalies, and throughput."""
+    out = console or Console()
+    _render_overview(stats, out)
+    _render_protocol_table(stats.get("protocol_counts", {}), out)
+    _render_top_hosts(stats.get("top_hosts", []), out)
+    _render_top_ports(stats.get("top_ports", []), out)
+    _render_anomalies(stats.get("anomaly_counts", {}), out)
+    _render_entropy_summary(stats.get("entropy_summary", {}), out)

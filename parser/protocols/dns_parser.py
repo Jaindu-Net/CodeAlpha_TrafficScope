@@ -19,42 +19,75 @@ _RECORD_TYPES: dict[int, str] = {
 }
 
 
+def _follow_pointer(
+    data: bytes,
+    pos: int,
+    visited: set[int],
+) -> tuple[int, int] | None:
+    """Resolve a 2-byte RFC 1035 label compression pointer safely."""
+    if pos + 1 >= len(data):
+        return None
+    ptr = ((data[pos] & 0x3F) << 8) | data[pos + 1]
+    if ptr >= len(data) or ptr in visited:
+        return None
+    visited.add(ptr)
+    return ptr, pos + 2
+
+
+def _step_qname(
+    data: bytes,
+    pos: int,
+    next_offset: int | None,
+    visited: set[int],
+    labels: list[str],
+) -> tuple[bool, int, int | None]:
+    """Process one DNS label or pointer step; returns (done, new_pos, next_offset)."""
+    length = data[pos]
+    if length == 0:
+        final_next = next_offset if next_offset is not None else pos + 1
+        return True, final_next, final_next
+
+    if (length & 0xC0) == 0xC0:
+        res = _follow_pointer(data, pos, visited)
+        if res is None:
+            return True, -1, None
+        new_pos, jump_after = res
+        return False, new_pos, (next_offset if next_offset is not None else jump_after)
+
+    if (length & 0xC0) or (pos + 1 + length > len(data)):
+        return True, -1, None
+
+    labels.append(data[pos + 1:pos + 1 + length].decode("ascii", errors="replace"))
+    return False, pos + 1 + length, next_offset
+
+
 def _read_qname(data: bytes, offset: int) -> tuple[str, int] | None:
     """Decode a DNS domain name supporting RFC 1035 compression pointers."""
     labels: list[str] = []
     pos = offset
     next_offset: int | None = None
-    visited_pointers: set[int] = set()
+    visited: set[int] = set()
 
     while pos < len(data):
-        length = data[pos]
-        if length == 0:
-            if next_offset is None:
-                next_offset = pos + 1
-            return ".".join(labels) if labels else ".", next_offset
-
-        if (length & 0xC0) == 0xC0:
-            if pos + 1 >= len(data):
-                return None
-            ptr = ((length & 0x3F) << 8) | data[pos + 1]
-            if ptr >= len(data) or ptr in visited_pointers:
-                return None
-            visited_pointers.add(ptr)
-            if next_offset is None:
-                next_offset = pos + 2
-            pos = ptr
-            continue
-
-        if length & 0xC0:
+        done, pos, next_offset = _step_qname(data, pos, next_offset, visited, labels)
+        if pos < 0:
             return None
-
-        end = pos + 1 + length
-        if end > len(data):
-            return None
-        labels.append(data[pos + 1:end].decode("ascii", errors="replace"))
-        pos = end
+        if done:
+            return ("." if not labels else ".".join(labels)), pos
 
     return None
+
+
+def _decode_txt_rdata(raw_rdata: bytes) -> str:
+    """Concatenate length-prefixed strings inside a DNS TXT record."""
+    parts: list[str] = []
+    idx = 0
+    while idx < len(raw_rdata):
+        txt_len = raw_rdata[idx]
+        idx += 1
+        parts.append(raw_rdata[idx:idx + txt_len].decode("utf-8", errors="replace"))
+        idx += txt_len
+    return "".join(parts)
 
 
 def _parse_rdata(data: bytes, rdata_offset: int, rdlength: int, qtype: int) -> str:
@@ -77,41 +110,16 @@ def _parse_rdata(data: bytes, rdata_offset: int, rdlength: int, qtype: int) -> s
         target = exchange[0] if exchange is not None else raw_rdata[2:].hex()
         return f"{pref} {target}"
     if qtype == 16:
-        parts: list[str] = []
-        idx = 0
-        while idx < len(raw_rdata):
-            txt_len = raw_rdata[idx]
-            idx += 1
-            parts.append(raw_rdata[idx:idx + txt_len].decode("utf-8", errors="replace"))
-            idx += txt_len
-        return "".join(parts)
+        return _decode_txt_rdata(raw_rdata)
     return raw_rdata.hex()
 
 
-def parse_dns(payload: bytes, *, is_tcp: bool = False) -> dict[str, Any] | None:
-    """Parse a DNS packet from raw UDP or TCP payload bytes."""
-    data = payload
-    if is_tcp:
-        if len(data) < 2:
-            return None
-        msg_len = struct.unpack_from("!H", data, 0)[0]
-        if len(data) < 2 + msg_len:
-            return None
-        data = data[2:2 + msg_len]
-
-    if len(data) < 12:
-        return None
-
-    tx_id, flags, qdcount, ancount, nscount, arcount = struct.unpack_from("!HHHHHH", data, 0)
-    is_response = bool((flags >> 15) & 0x01)
-    opcode = (flags >> 11) & 0x0F
-    rcode = flags & 0x0F
-
-    # Reject garbage payloads claiming absurd counts relative to packet size.
-    if qdcount > 32 or ancount > 128:
-        return None
-
-    offset = 12
+def _parse_questions(
+    data: bytes,
+    offset: int,
+    qdcount: int,
+) -> tuple[list[dict[str, Any]], int] | None:
+    """Parse DNS question entries starting at offset."""
     questions: list[dict[str, Any]] = []
     for _ in range(qdcount):
         name_res = _read_qname(data, offset)
@@ -129,7 +137,15 @@ def parse_dns(payload: bytes, *, is_tcp: bool = False) -> dict[str, Any] | None:
                 "qclass": qclass,
             }
         )
+    return questions, offset
 
+
+def _parse_answers(
+    data: bytes,
+    offset: int,
+    ancount: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse DNS answer resource records starting at offset."""
     answers: list[dict[str, Any]] = []
     response_ips: list[str] = []
     for _ in range(ancount):
@@ -146,11 +162,10 @@ def parse_dns(payload: bytes, *, is_tcp: bool = False) -> dict[str, Any] | None:
         rdata_str = _parse_rdata(data, offset, rdlength, rtype)
         offset += rdlength
 
-        type_name = _RECORD_TYPES.get(rtype, str(rtype))
         answers.append(
             {
                 "name": rname,
-                "type": type_name,
+                "type": _RECORD_TYPES.get(rtype, str(rtype)),
                 "class": rclass,
                 "ttl": ttl,
                 "rdata": rdata_str,
@@ -158,12 +173,42 @@ def parse_dns(payload: bytes, *, is_tcp: bool = False) -> dict[str, Any] | None:
         )
         if rtype in (1, 28) and rdata_str:
             response_ips.append(rdata_str)
+    return answers, response_ips
+
+
+def _extract_dns_message_bytes(payload: bytes, is_tcp: bool) -> bytes | None:
+    """Strip TCP 2-byte length prefix when parsing DNS-over-TCP."""
+    if not is_tcp:
+        return payload if len(payload) >= 12 else None
+    if len(payload) < 2:
+        return None
+    msg_len = struct.unpack_from("!H", payload, 0)[0]
+    if len(payload) < 2 + msg_len or msg_len < 12:
+        return None
+    return payload[2:2 + msg_len]
+
+
+def parse_dns(payload: bytes, *, is_tcp: bool = False) -> dict[str, Any] | None:
+    """Parse a DNS packet from raw UDP or TCP payload bytes."""
+    data = _extract_dns_message_bytes(payload, is_tcp)
+    if data is None:
+        return None
+
+    tx_id, flags, qdcount, ancount, nscount, arcount = struct.unpack_from("!HHHHHH", data, 0)
+    if qdcount > 32 or ancount > 128:
+        return None
+
+    q_res = _parse_questions(data, 12, qdcount)
+    if q_res is None:
+        return None
+    questions, offset = q_res
+    answers, response_ips = _parse_answers(data, offset, ancount)
 
     return {
         "transaction_id": tx_id,
-        "is_response": is_response,
-        "opcode": opcode,
-        "rcode": rcode,
+        "is_response": bool((flags >> 15) & 0x01),
+        "opcode": (flags >> 11) & 0x0F,
+        "rcode": flags & 0x0F,
         "questions": questions,
         "answers": answers,
         "response_ips": response_ips,

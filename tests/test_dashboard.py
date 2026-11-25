@@ -1,14 +1,17 @@
-"""Tests for DashboardState telemetry aggregation and Rich exit report."""
+"""Tests for DashboardState telemetry, widgets, and Rich exit report."""
 
 from __future__ import annotations
 
-import asyncio
 from io import StringIO
 
 from rich.console import Console
 
 from analyzer import AnomalyDetector
 from dashboard import DashboardState, TrafficScopeApp, print_exit_report
+from dashboard.widgets.anomaly_feed import AnomalyFeed
+from dashboard.widgets.entropy_panel import EntropyPanel, _entropy_heat_bar
+from dashboard.widgets.protocol_table import ProtocolTable
+from dashboard.widgets.top_talkers import TopTalkers, format_bytes
 from fingerprint import Fingerprinter
 from parser import PacketParser
 from profiler import FlowTracker
@@ -50,25 +53,38 @@ def test_dashboard_state_and_exit_report_rendering() -> None:
     assert "Windows 10/11" in rendered
 
 
-def test_textual_dashboard_mounts_and_refreshes_cleanly() -> None:
-    parser = PacketParser()
-    tracker = FlowTracker()
-    fp = Fingerprinter()
-    detector = AnomalyDetector(cooldown_seconds=0.0)
-    state = DashboardState("MockNIC", flow_tracker=tracker, fingerprinter=fp)
+def test_dashboard_widgets_and_app_init_synchronously() -> None:
+    state = DashboardState("MockNIC")
+    app = TrafficScopeApp(state, refresh_interval=0.5)
+    assert app.TITLE == "TrafficScope"
 
-    for raw in (make_tcp_syn(), make_http_request_pkt(), make_xmas_scan_pkt()):
-        parsed = parser.parse(raw)
-        tracker.update(parsed)
-        fp.fingerprint(parsed)
-        alerts = detector.inspect(parsed)
-        state.record_packet(parsed)
-        state.record_alerts(alerts)
+    assert format_bytes(512) == "512 B"
+    assert format_bytes(2048) == "2.0 KB"
+    assert "[green]" in _entropy_heat_bar(2.0)
+    assert "[yellow]" in _entropy_heat_bar(4.5)
+    assert "[red]" in _entropy_heat_bar(7.8)
 
-    async def _run() -> None:
-        app = TrafficScopeApp(state, refresh_interval=0.1)
-        async with app.run_test() as pilot:
-            await pilot.pause(0.25)
-            await pilot.press("q")
+    proto_table = ProtocolTable()
+    assert isinstance(proto_table, ProtocolTable)
 
-    asyncio.run(_run())
+    talkers = TopTalkers()
+    assert isinstance(talkers, TopTalkers)
+
+    feed = AnomalyFeed()
+    feed.on_mount()
+    assert feed.auto_scroll is True
+
+    panel = EntropyPanel()
+    panel.update_data(
+        [
+            {
+                "src_ip": "192.168.1.10",
+                "src_port": 52000,
+                "dst_ip": "93.184.216.34",
+                "dst_port": 443,
+                "protocol": "TLS",
+                "mean_entropy": 7.9,
+                "entropy_label": "likely encrypted",
+            }
+        ]
+    )

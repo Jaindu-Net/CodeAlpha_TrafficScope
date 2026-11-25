@@ -111,33 +111,33 @@ def format_interfaces_table(interfaces: list[InterfaceInfo]) -> Table:
     return table
 
 
-def _match_interface(query: str, interfaces: list[InterfaceInfo]) -> InterfaceInfo:
-    """Resolve an interface query by index, exact name/GUID, or unique substring."""
-    stripped = query.strip()
-    if not stripped:
-        raise ValueError("Interface selector cannot be empty.")
+def _match_by_index(seq_idx: int, interfaces: list[InterfaceInfo]) -> InterfaceInfo:
+    """Resolve a numeric interface selector against list position or OS index."""
+    if 0 <= seq_idx < len(interfaces):
+        return interfaces[seq_idx]
+    for iface in interfaces:
+        if iface.index == seq_idx:
+            return iface
+    raise ValueError(f"Interface index {seq_idx} is out of range (0-{len(interfaces) - 1}).")
 
-    if stripped.isdigit():
-        seq_idx = int(stripped)
-        if 0 <= seq_idx < len(interfaces):
-            return interfaces[seq_idx]
-        for iface in interfaces:
-            if iface.index == seq_idx:
-                return iface
-        raise ValueError(f"Interface index {seq_idx} is out of range (0-{len(interfaces) - 1}).")
 
-    lowered = stripped.lower()
+def _matches_substring(iface: InterfaceInfo, lowered: str) -> bool:
+    """Return True if lowered query appears in any interface identifier field."""
+    return (
+        lowered in iface.name.lower()
+        or lowered in iface.description.lower()
+        or lowered in iface.network_name.lower()
+    )
+
+
+def _match_by_name(query: str, interfaces: list[InterfaceInfo]) -> InterfaceInfo:
+    """Resolve an interface query by exact name/GUID or unique substring."""
+    lowered = query.lower()
     for iface in interfaces:
         if iface.name.lower() == lowered or iface.network_name.lower() == lowered:
             return iface
 
-    partial_matches = [
-        iface
-        for iface in interfaces
-        if lowered in iface.name.lower()
-        or lowered in iface.description.lower()
-        or lowered in iface.network_name.lower()
-    ]
+    partial_matches = [iface for iface in interfaces if _matches_substring(iface, lowered)]
     if len(partial_matches) == 1:
         return partial_matches[0]
     if len(partial_matches) > 1:
@@ -146,6 +146,16 @@ def _match_interface(query: str, interfaces: list[InterfaceInfo]) -> InterfaceIn
 
     available = ", ".join(item.name for item in interfaces)
     raise ValueError(f"Unknown interface '{query}'. Available: {available}")
+
+
+def _match_interface(query: str, interfaces: list[InterfaceInfo]) -> InterfaceInfo:
+    """Resolve an interface query by index, exact name/GUID, or unique substring."""
+    stripped = query.strip()
+    if not stripped:
+        raise ValueError("Interface selector cannot be empty.")
+    if stripped.isdigit():
+        return _match_by_index(int(stripped), interfaces)
+    return _match_by_name(stripped, interfaces)
 
 
 def select_interface(

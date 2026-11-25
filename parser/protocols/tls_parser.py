@@ -55,15 +55,40 @@ def _parse_alpn_extension(ext_data: bytes) -> list[str]:
     return protocols
 
 
-def parse_tls_client_hello(payload: bytes) -> dict[str, Any] | None:
-    """Extract unencrypted handshake metadata from a TLS ClientHello record.
+def _parse_extensions(
+    payload: bytes,
+    pos: int,
+    hello_end: int,
+) -> tuple[list[int], str | None, list[str]]:
+    """Parse TLS extensions block and extract SNI and ALPN metadata."""
+    extensions: list[int] = []
+    sni: str | None = None
+    alpn: list[str] = []
+    if pos + 2 > hello_end:
+        return extensions, sni, alpn
 
-    Never attempts decryption. Returns None for non-ClientHello records,
-    truncated frames, or UDP QUIC Initial packets.
-    """
+    exts_len = struct.unpack_from("!H", payload, pos)[0]
+    pos += 2
+    exts_end = min(hello_end, pos + exts_len)
+    while pos + 4 <= exts_end:
+        ext_type, ext_len = struct.unpack_from("!HH", payload, pos)
+        pos += 4
+        if pos + ext_len > exts_end:
+            break
+        extensions.append(ext_type)
+        ext_data = payload[pos:pos + ext_len]
+        if ext_type == 0x0000 and sni is None:
+            sni = _parse_sni_extension(ext_data)
+        elif ext_type == 0x0010 and not alpn:
+            alpn = _parse_alpn_extension(ext_data)
+        pos += ext_len
+    return extensions, sni, alpn
+
+
+def _validate_client_hello_header(payload: bytes) -> tuple[int, int, int, int] | None:
+    """Validate TLS record + ClientHello header, returning (rec_ver, cli_ver, pos, end)."""
     if len(payload) < 43:
         return None
-
     content_type = payload[0]
     record_version = struct.unpack_from("!H", payload, 1)[0]
     record_length = struct.unpack_from("!H", payload, 3)[0]
@@ -71,24 +96,30 @@ def parse_tls_client_hello(payload: bytes) -> dict[str, Any] | None:
         return None
 
     record_end = min(len(payload), 5 + record_length)
-    pos = 5
-    if pos + 4 > record_end:
+    if 9 > record_end or payload[5] != 0x01:
         return None
 
-    handshake_type = payload[pos]
-    handshake_len = int.from_bytes(payload[pos + 1:pos + 4], "big")
-    if handshake_type != 0x01:
-        return None
-
-    pos += 4
+    handshake_len = int.from_bytes(payload[6:9], "big")
+    pos = 9
     hello_end = min(record_end, pos + handshake_len)
     if pos + 34 > hello_end:
         return None
 
     client_version = struct.unpack_from("!H", payload, pos)[0]
-    pos += 2 + 32  # Skip client_version + 32-byte client random
+    return record_version, client_version, pos + 34, hello_end
 
-    # Session ID
+
+def parse_tls_client_hello(payload: bytes) -> dict[str, Any] | None:
+    """Extract unencrypted handshake metadata from a TLS ClientHello record.
+
+    Never attempts decryption. Returns None for non-ClientHello records,
+    truncated frames, or UDP QUIC Initial packets.
+    """
+    hdr = _validate_client_hello_header(payload)
+    if hdr is None:
+        return None
+    record_version, client_version, pos, hello_end = hdr
+
     if pos >= hello_end:
         return None
     session_id_len = payload[pos]
@@ -96,7 +127,6 @@ def parse_tls_client_hello(payload: bytes) -> dict[str, Any] | None:
     if pos + 2 > hello_end:
         return None
 
-    # Cipher Suites
     cipher_suites_len = struct.unpack_from("!H", payload, pos)[0]
     pos += 2
     if cipher_suites_len % 2 != 0 or pos + cipher_suites_len > hello_end:
@@ -107,7 +137,6 @@ def parse_tls_client_hello(payload: bytes) -> dict[str, Any] | None:
     ]
     pos += cipher_suites_len
 
-    # Compression Methods
     if pos >= hello_end:
         return None
     comp_len = payload[pos]
@@ -117,28 +146,7 @@ def parse_tls_client_hello(payload: bytes) -> dict[str, Any] | None:
     compression_methods = list(payload[pos:pos + comp_len])
     pos += comp_len
 
-    # Extensions (optional in older SSL/TLS)
-    sni: str | None = None
-    alpn: list[str] = []
-    extensions: list[int] = []
-
-    if pos + 2 <= hello_end:
-        exts_len = struct.unpack_from("!H", payload, pos)[0]
-        pos += 2
-        exts_end = min(hello_end, pos + exts_len)
-        while pos + 4 <= exts_end:
-            ext_type, ext_len = struct.unpack_from("!HH", payload, pos)
-            pos += 4
-            if pos + ext_len > exts_end:
-                break
-            extensions.append(ext_type)
-            ext_data = payload[pos:pos + ext_len]
-            if ext_type == 0x0000 and sni is None:
-                sni = _parse_sni_extension(ext_data)
-            elif ext_type == 0x0010 and not alpn:
-                alpn = _parse_alpn_extension(ext_data)
-            pos += ext_len
-
+    extensions, sni, alpn = _parse_extensions(payload, pos, hello_end)
     return {
         "handshake_type": "ClientHello",
         "record_version": f"0x{record_version:04x}",

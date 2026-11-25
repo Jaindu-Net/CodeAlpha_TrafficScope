@@ -30,6 +30,18 @@ class FingerprintMatch:
     entry_confidence: int
 
 
+def _validate_ttl_range(ttl_range: Any, idx: int) -> tuple[int, int]:
+    """Validate a [min_ttl, max_ttl] pair within 0..255."""
+    valid_ints = (
+        isinstance(ttl_range, list)
+        and len(ttl_range) == 2
+        and all(isinstance(v, int) and 0 <= v <= 255 for v in ttl_range)
+    )
+    if not valid_ints or ttl_range[0] > ttl_range[1]:
+        raise ValueError(f"Fingerprint entry #{idx} 'ttl_range' must be [min, max] in 0..255.")
+    return (ttl_range[0], ttl_range[1])
+
+
 def _validate_entry(raw: Any, idx: int) -> FingerprintEntry:
     """Validate and convert a raw JSON dictionary into a FingerprintEntry."""
     if not isinstance(raw, dict):
@@ -41,34 +53,53 @@ def _validate_entry(raw: Any, idx: int) -> FingerprintEntry:
         raise ValueError(f"Fingerprint entry #{idx} missing keys: {sorted(missing)}")
 
     os_name = raw["os"]
-    ttl_range = raw["ttl_range"]
-    window_size = raw["window_size"]
-    opts = raw["tcp_options_order"]
-    confidence = raw["confidence"]
-
     if not isinstance(os_name, str) or not os_name.strip():
         raise ValueError(f"Fingerprint entry #{idx} 'os' must be a non-empty string.")
-    if (
-        not isinstance(ttl_range, list)
-        or len(ttl_range) != 2
-        or not all(isinstance(v, int) and 0 <= v <= 255 for v in ttl_range)
-        or ttl_range[0] > ttl_range[1]
-    ):
-        raise ValueError(f"Fingerprint entry #{idx} 'ttl_range' must be [min, max] in 0..255.")
+
+    ttl_pair = _validate_ttl_range(raw["ttl_range"], idx)
+    window_size = raw["window_size"]
     if window_size is not None and (not isinstance(window_size, int) or window_size < 0):
         raise ValueError(f"Fingerprint entry #{idx} 'window_size' must be int >= 0 or null.")
+
+    opts = raw["tcp_options_order"]
     if not isinstance(opts, list) or not all(isinstance(o, str) for o in opts):
         raise ValueError(f"Fingerprint entry #{idx} 'tcp_options_order' must be list[str].")
+
+    confidence = raw["confidence"]
     if not isinstance(confidence, int) or not (1 <= confidence <= 100):
         raise ValueError(f"Fingerprint entry #{idx} 'confidence' must be int in 1..100.")
 
     return FingerprintEntry(
         os=os_name.strip(),
-        ttl_range=(ttl_range[0], ttl_range[1]),
+        ttl_range=ttl_pair,
         window_size=window_size,
         tcp_options_order=tuple(opts),
         confidence=confidence,
     )
+
+
+def _score_entry(
+    entry: FingerprintEntry,
+    ttl: int,
+    window: int,
+    obs_opts: tuple[str, ...],
+    obs_no_nop: tuple[str, ...],
+) -> int:
+    """Compute structural match score (0-100) for one fingerprint DB entry."""
+    if not (entry.ttl_range[0] <= ttl <= entry.ttl_range[1]):
+        return 0
+
+    score = 40
+    if entry.window_size is None:
+        score += 15
+    elif entry.window_size == window:
+        score += 30
+
+    if entry.tcp_options_order == obs_opts:
+        score += 30
+    elif obs_no_nop and tuple(o for o in entry.tcp_options_order if o != "NOP") == obs_no_nop:
+        score += 15
+    return score
 
 
 class FingerprintDB:
@@ -108,27 +139,7 @@ class FingerprintDB:
         matches: list[FingerprintMatch] = []
 
         for entry in self.entries:
-            score = 0
-            if entry.ttl_range[0] <= ttl <= entry.ttl_range[1]:
-                score += 40
-            else:
-                # Never match an OS whose TTL epoch cannot possibly produce this TTL.
-                continue
-
-            if entry.window_size is not None:
-                if entry.window_size == window:
-                    score += 30
-            else:
-                score += 15
-
-            if entry.tcp_options_order == obs_opts:
-                score += 30
-            elif (
-                obs_no_nop
-                and tuple(o for o in entry.tcp_options_order if o != "NOP") == obs_no_nop
-            ):
-                score += 15
-
+            score = _score_entry(entry, ttl, window, obs_opts, obs_no_nop)
             if score >= min_score:
                 matches.append(
                     FingerprintMatch(

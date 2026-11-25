@@ -78,66 +78,73 @@ class IPDefragmenter:
         self.expired_count += len(expired_keys)
         return len(expired_keys)
 
+    def _get_or_create_assembly_locked(self, pkt: ParsedPacket, key: FragKey) -> _FragmentAssembly:
+        """Look up or initialize a fragment assembly record while holding self._lock."""
+        assembly = self._assemblies.get(key)
+        if assembly is not None:
+            return assembly
+        assert pkt.ip_src is not None and pkt.ip_dst is not None
+        assert pkt.ip_proto is not None and pkt.ip_id is not None
+        assembly = _FragmentAssembly(
+            created_at=pkt.timestamp,
+            last_seen=pkt.timestamp,
+            eth_src=pkt.eth_src,
+            eth_dst=pkt.eth_dst,
+            ip_src=pkt.ip_src,
+            ip_dst=pkt.ip_dst,
+            ip_ttl=pkt.ip_ttl if pkt.ip_ttl is not None else 64,
+            ip_proto=pkt.ip_proto,
+            ip_id=pkt.ip_id,
+        )
+        self._assemblies[key] = assembly
+        return assembly
+
+    def _record_fragment_locked(
+        self,
+        assembly: _FragmentAssembly,
+        pkt: ParsedPacket,
+        frag_data: bytes,
+        key: FragKey,
+    ) -> None:
+        """Store fragment payload and metadata inside assembly while holding self._lock."""
+        assembly.last_seen = pkt.timestamp
+        if pkt.ip_frag_offset == 0 and pkt.ip_header_bytes:
+            assembly.first_header = pkt.ip_header_bytes
+
+        offset = pkt.ip_frag_offset
+        if _detect_overlap(assembly.fragments, offset, len(frag_data)):
+            assembly.overlap_detected = True
+            self.overlap_count += 1
+            logger.warning("IP fragment overlap detected for %s at offset %d", key, offset)
+
+        if offset not in assembly.fragments:
+            assembly.fragments[offset] = frag_data
+        if "MF" not in pkt.ip_flags:
+            assembly.total_len = offset + len(frag_data)
+
     def add_fragment(self, pkt: ParsedPacket) -> ParsedPacket | None:
-        """Process a ParsedPacket, returning a reassembled ParsedPacket when complete.
-
-        Non-fragmented packets are returned unchanged immediately. Incomplete
-        fragments return None until the final fragment closes all byte gaps.
-        """
-        is_fragment = pkt.ip_frag_offset > 0 or ("MF" in pkt.ip_flags)
-        if not is_fragment:
+        """Process a ParsedPacket, returning a reassembled ParsedPacket when complete."""
+        if pkt.ip_frag_offset == 0 and "MF" not in pkt.ip_flags:
             return pkt
-
-        if pkt.ip_id is None or pkt.ip_src is None or pkt.ip_dst is None or pkt.ip_proto is None:
+        if None in (pkt.ip_id, pkt.ip_src, pkt.ip_dst, pkt.ip_proto):
             return None
 
+        assert pkt.ip_id is not None and pkt.ip_src is not None
+        assert pkt.ip_dst is not None and pkt.ip_proto is not None
         frag_data = pkt.ip_fragment_data or pkt.payload_bytes
-        if not frag_data and pkt.ip_frag_offset == 0 and "MF" not in pkt.ip_flags:
-            return pkt
-
         key: FragKey = (pkt.ip_id, pkt.ip_src, pkt.ip_dst, pkt.ip_proto)
-        now = pkt.timestamp
 
         with self._lock:
-            self._prune_locked(now)
-            assembly = self._assemblies.get(key)
-            if assembly is None:
-                assembly = _FragmentAssembly(
-                    created_at=now,
-                    last_seen=now,
-                    eth_src=pkt.eth_src,
-                    eth_dst=pkt.eth_dst,
-                    ip_src=pkt.ip_src,
-                    ip_dst=pkt.ip_dst,
-                    ip_ttl=pkt.ip_ttl if pkt.ip_ttl is not None else 64,
-                    ip_proto=pkt.ip_proto,
-                    ip_id=pkt.ip_id,
-                )
-                self._assemblies[key] = assembly
-
-            assembly.last_seen = now
-            if pkt.ip_frag_offset == 0 and pkt.ip_header_bytes:
-                assembly.first_header = pkt.ip_header_bytes
-
-            offset = pkt.ip_frag_offset
-            if _detect_overlap(assembly.fragments, offset, len(frag_data)):
-                assembly.overlap_detected = True
-                self.overlap_count += 1
-                logger.warning("IP fragment overlap detected for %s at offset %d", key, offset)
-
-            if offset not in assembly.fragments:
-                assembly.fragments[offset] = frag_data
-
-            if "MF" not in pkt.ip_flags:
-                assembly.total_len = offset + len(frag_data)
-
+            self._prune_locked(pkt.timestamp)
+            assembly = self._get_or_create_assembly_locked(pkt, key)
+            self._record_fragment_locked(assembly, pkt, frag_data, key)
             if not _is_complete(assembly):
                 return None
 
             reassembled_payload = _assemble_first_seen(assembly.fragments, assembly.total_len or 0)
             del self._assemblies[key]
 
-        rebuilt_scapy = self._build_reassembled_packet(assembly, reassembled_payload, now)
+        rebuilt_scapy = self._build_reassembled_packet(assembly, reassembled_payload, pkt.timestamp)
         return self._parser.parse(rebuilt_scapy)
 
     def _build_reassembled_packet(
@@ -169,11 +176,10 @@ class IPDefragmenter:
 def _detect_overlap(existing: dict[int, bytes], offset: int, length: int) -> bool:
     """Return True if [offset, offset + length) overlaps any stored fragment."""
     new_end = offset + length
-    for ex_start, ex_data in existing.items():
-        ex_end = ex_start + len(ex_data)
-        if offset < ex_end and ex_start < new_end:
-            return True
-    return False
+    return any(
+        offset < (ex_start + len(ex_data)) and ex_start < new_end
+        for ex_start, ex_data in existing.items()
+    )
 
 
 def _is_complete(assembly: _FragmentAssembly) -> bool:
@@ -184,9 +190,7 @@ def _is_complete(assembly: _FragmentAssembly) -> bool:
     for start in sorted(assembly.fragments):
         if start > cursor:
             return False
-        end = start + len(assembly.fragments[start])
-        if end > cursor:
-            cursor = end
+        cursor = max(cursor, start + len(assembly.fragments[start]))
         if cursor >= assembly.total_len:
             return True
     return cursor >= assembly.total_len

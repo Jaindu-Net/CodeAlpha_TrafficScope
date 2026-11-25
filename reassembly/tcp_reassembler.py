@@ -33,17 +33,21 @@ def _infer_endpoints(pkt: ParsedPacket) -> tuple[tuple[str, int], tuple[str, int
     dst_ep = (pkt.ip_dst, dport)
 
     flags = pkt.tcp_flags or 0
-    if (flags & _FLAG_SYN) and not (flags & _FLAG_ACK):
-        return src_ep, dst_ep
-    if (flags & _FLAG_SYN) and (flags & _FLAG_ACK):
-        return dst_ep, src_ep
+    if flags & _FLAG_SYN:
+        return (dst_ep, src_ep) if (flags & _FLAG_ACK) else (src_ep, dst_ep)
 
     if sport in _WELL_KNOWN_SERVER_PORTS and dport not in _WELL_KNOWN_SERVER_PORTS:
         return dst_ep, src_ep
-    if dport in _WELL_KNOWN_SERVER_PORTS and sport not in _WELL_KNOWN_SERVER_PORTS:
-        return src_ep, dst_ep
-
     return src_ep, dst_ep
+
+
+def _anchor_isn(dir_buf: DirectionBuffer, seq: int) -> None:
+    """Anchor a direction buffer's initial sequence numbers from a SYN flag."""
+    if not dir_buf.isn_anchored:
+        isn_next = (seq + 1) & 0xFFFFFFFF
+        dir_buf.base_seq = isn_next
+        dir_buf.next_seq = isn_next
+        dir_buf.isn_anchored = True
 
 
 class TCPReassembler:
@@ -58,6 +62,59 @@ class TCPReassembler:
         """Initialize the TCP reassembler with a StreamStore instance."""
         self.store = store or StreamStore(idle_timeout_seconds=idle_timeout_seconds)
 
+    def _get_or_create_stream_locked(self, pkt: ParsedPacket, flow_key: FlowKey) -> StreamState:
+        """Look up or initialize a TCP StreamState while holding store.lock."""
+        stream = self.store.get(flow_key)
+        if stream is not None:
+            return stream
+        client_ep, server_ep = _infer_endpoints(pkt)
+        stream = StreamState(
+            flow_key=flow_key,
+            client_endpoint=client_ep,
+            server_endpoint=server_ep,
+            created_at=pkt.timestamp,
+            last_seen=pkt.timestamp,
+        )
+        self.store.put(stream)
+        return stream
+
+    def _apply_fin(self, stream: StreamState, dir_buf: DirectionBuffer, is_client: bool) -> None:
+        """Record FIN arrival and transition connection state."""
+        if is_client:
+            stream.client_fin_seen = True
+        else:
+            stream.server_fin_seen = True
+        if dir_buf.next_seq is not None:
+            dir_buf.next_seq = (dir_buf.next_seq + 1) & 0xFFFFFFFF
+        if stream.client_fin_seen and stream.server_fin_seen:
+            stream.state = "CLOSED"
+        elif stream.state != "CLOSED":
+            stream.state = "FIN_WAIT"
+
+    def _record_payload(
+        self,
+        stream: StreamState,
+        dir_buf: DirectionBuffer,
+        direction: str,
+        pkt: ParsedPacket,
+    ) -> None:
+        """Assemble payload bytes for one TCP segment and append to stream conversation."""
+        assert pkt.tcp_seq is not None
+        if not pkt.payload_bytes:
+            return
+        if stream.state == "NEW":
+            stream.state = "ESTABLISHED"
+        assembled_chunk, prepended = self._insert_payload(
+            dir_buf, pkt.tcp_seq, pkt.payload_bytes
+        )
+        if not assembled_chunk:
+            return
+        entry = (direction, assembled_chunk)
+        if prepended:
+            stream.conversation.insert(0, entry)
+        else:
+            stream.conversation.append(entry)
+
     def add_segment(self, pkt: ParsedPacket) -> StreamState | None:
         """Process a parsed TCP packet, updating stream state and ordered buffers."""
         if pkt.transport_proto != "TCP" or pkt.flow_key is None or pkt.tcp_seq is None:
@@ -66,55 +123,20 @@ class TCPReassembler:
             return None
 
         flow_key = pkt.flow_key
-        now = pkt.timestamp
-
         with self.store.lock:
-            self.store.prune_expired(now)
-            stream = self.store.get(flow_key)
-            if stream is None:
-                client_ep, server_ep = _infer_endpoints(pkt)
-                stream = StreamState(
-                    flow_key=flow_key,
-                    client_endpoint=client_ep,
-                    server_endpoint=server_ep,
-                    created_at=now,
-                    last_seen=now,
-                )
-                self.store.put(stream)
+            self.store.prune_expired(pkt.timestamp)
+            stream = self._get_or_create_stream_locked(pkt, flow_key)
+            stream.last_seen = pkt.timestamp
 
-            stream.last_seen = now
-            src_ep = (pkt.ip_src, pkt.src_port or 0)
-            is_client = src_ep == stream.client_endpoint
+            is_client = (pkt.ip_src, pkt.src_port or 0) == stream.client_endpoint
             direction = "CLIENT" if is_client else "SERVER"
             dir_buf = stream.client_buffer if is_client else stream.server_buffer
 
             flags = pkt.tcp_flags or 0
             self._update_state_machine(stream, dir_buf, is_client, flags, pkt.tcp_seq)
-
-            if pkt.payload_bytes:
-                if stream.state == "NEW":
-                    stream.state = "ESTABLISHED"
-                assembled_chunk, prepended = self._insert_payload(
-                    dir_buf, pkt.tcp_seq, pkt.payload_bytes
-                )
-                if assembled_chunk:
-                    if prepended:
-                        stream.conversation.insert(0, (direction, assembled_chunk))
-                    else:
-                        stream.conversation.append((direction, assembled_chunk))
-
+            self._record_payload(stream, dir_buf, direction, pkt)
             if flags & _FLAG_FIN:
-                if is_client:
-                    stream.client_fin_seen = True
-                else:
-                    stream.server_fin_seen = True
-                if dir_buf.next_seq is not None:
-                    dir_buf.next_seq = (dir_buf.next_seq + 1) & 0xFFFFFFFF
-                if stream.client_fin_seen and stream.server_fin_seen:
-                    stream.state = "CLOSED"
-                elif stream.state != "CLOSED":
-                    stream.state = "FIN_WAIT"
-
+                self._apply_fin(stream, dir_buf, is_client)
             return stream
 
     def _update_state_machine(
@@ -135,23 +157,63 @@ class TCPReassembler:
                 stream.state = "SYN_SEEN"
                 if stream.client_isn is None:
                     stream.client_isn = seq
-                if not dir_buf.isn_anchored:
-                    isn_next = (seq + 1) & 0xFFFFFFFF
-                    dir_buf.base_seq = isn_next
-                    dir_buf.next_seq = isn_next
-                    dir_buf.isn_anchored = True
-            else:
-                if stream.server_isn is None:
-                    stream.server_isn = seq
-                if not dir_buf.isn_anchored:
-                    isn_next = (seq + 1) & 0xFFFFFFFF
-                    dir_buf.base_seq = isn_next
-                    dir_buf.next_seq = isn_next
-                    dir_buf.isn_anchored = True
+            elif stream.server_isn is None:
+                stream.server_isn = seq
+            _anchor_isn(dir_buf, seq)
             return
 
         if (flags & _FLAG_ACK) and stream.state == "SYN_SEEN":
             stream.state = "ESTABLISHED"
+
+    def _handle_midstream_prefix(
+        self,
+        dir_buf: DirectionBuffer,
+        seq: int,
+        payload: bytes,
+    ) -> tuple[bytes, bool] | None:
+        """Prepend earlier out-of-order prefix when capture started mid-stream."""
+        assert dir_buf.base_seq is not None and dir_buf.next_seq is not None
+        if dir_buf.isn_anchored or _seq_diff(seq, dir_buf.base_seq) >= 0:
+            return None
+
+        end_offset = _seq_diff((seq + len(payload)) & 0xFFFFFFFF, dir_buf.base_seq)
+        if end_offset < 0:
+            return None
+
+        prefix_len = _seq_diff(dir_buf.base_seq, seq)
+        prefix = payload[:prefix_len]
+        dir_buf.reassembled = bytearray(prefix) + dir_buf.reassembled
+        dir_buf.base_seq = seq
+        dir_buf.out_of_order_count += 1
+
+        tail_offset = _seq_diff((seq + len(payload)) & 0xFFFFFFFF, dir_buf.next_seq)
+        if tail_offset > 0:
+            tail = payload[len(payload) - tail_offset:]
+            dir_buf.reassembled.extend(tail)
+            dir_buf.next_seq = (dir_buf.next_seq + len(tail)) & 0xFFFFFFFF
+        return prefix, True
+
+    def _buffer_out_of_order(
+        self,
+        dir_buf: DirectionBuffer,
+        seq: int,
+        offset: int,
+        payload: bytes,
+    ) -> None:
+        """Store an out-of-order segment in sequence-sorted pending list."""
+        assert dir_buf.next_seq is not None
+        dir_buf.out_of_order_count += 1
+        pending_total = sum(len(item[1]) for item in dir_buf.pending)
+        if pending_total + len(payload) > _MAX_PENDING_BYTES_PER_DIRECTION:
+            return
+
+        if any(ex_seq == seq and ex_data == payload for ex_seq, ex_data in dir_buf.pending):
+            dir_buf.retransmissions += 1
+            return
+
+        keys = [_seq_diff(item[0], dir_buf.next_seq) for item in dir_buf.pending]
+        pos = bisect.bisect_left(keys, offset)
+        dir_buf.pending.insert(pos, (seq, payload))
 
     def _insert_payload(
         self,
@@ -164,33 +226,16 @@ class TCPReassembler:
             dir_buf.base_seq = seq
             dir_buf.next_seq = seq
 
-        assert dir_buf.base_seq is not None and dir_buf.next_seq is not None
+        midstream_res = self._handle_midstream_prefix(dir_buf, seq, payload)
+        if midstream_res is not None:
+            return midstream_res
 
-        # Mid-stream capture (no SYN seen): handle earlier out-of-order prefix segments.
-        if not dir_buf.isn_anchored and _seq_diff(seq, dir_buf.base_seq) < 0:
-            end_offset = _seq_diff((seq + len(payload)) & 0xFFFFFFFF, dir_buf.base_seq)
-            if end_offset >= 0:
-                prefix_len = _seq_diff(dir_buf.base_seq, seq)
-                prefix = payload[:prefix_len]
-                dir_buf.reassembled = bytearray(prefix) + dir_buf.reassembled
-                dir_buf.base_seq = seq
-                dir_buf.out_of_order_count += 1
-                # Also process any suffix beyond next_seq if this single segment spans across.
-                tail_offset = _seq_diff((seq + len(payload)) & 0xFFFFFFFF, dir_buf.next_seq)
-                if tail_offset > 0:
-                    tail = payload[len(payload) - tail_offset:]
-                    dir_buf.reassembled.extend(tail)
-                    dir_buf.next_seq = (dir_buf.next_seq + len(tail)) & 0xFFFFFFFF
-                return prefix, True
-
+        assert dir_buf.next_seq is not None
         offset = _seq_diff(seq, dir_buf.next_seq)
-
-        # Pure retransmission of already-assembled bytes.
         if offset + len(payload) <= 0:
             dir_buf.retransmissions += 1
             return b"", False
 
-        # Partial overlap with already-assembled prefix.
         if offset < 0:
             payload = payload[-offset:]
             seq = dir_buf.next_seq
@@ -203,21 +248,7 @@ class TCPReassembler:
             self._drain_pending(dir_buf, newly_contiguous)
             return bytes(newly_contiguous), False
 
-        # Out-of-order segment: deduplicate and store in sequence-sorted pending list.
-        dir_buf.out_of_order_count += 1
-        pending_total = sum(len(item[1]) for item in dir_buf.pending)
-        if pending_total + len(payload) > _MAX_PENDING_BYTES_PER_DIRECTION:
-            return b"", False
-
-        for ex_seq, ex_data in dir_buf.pending:
-            if ex_seq == seq and ex_data == payload:
-                dir_buf.retransmissions += 1
-                return b"", False
-
-        # Sort keys by signed offset relative to current next_seq.
-        keys = [_seq_diff(item[0], dir_buf.next_seq) for item in dir_buf.pending]
-        pos = bisect.bisect_left(keys, offset)
-        dir_buf.pending.insert(pos, (seq, payload))
+        self._buffer_out_of_order(dir_buf, seq, offset, payload)
         return b"", False
 
     def _drain_pending(self, dir_buf: DirectionBuffer, out: bytearray) -> None:

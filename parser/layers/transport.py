@@ -7,14 +7,51 @@ import struct
 from typing import Any
 
 from scapy.layers.inet import ICMP, IP, TCP, UDP
-from scapy.layers.inet6 import (
-    ICMPv6EchoReply,
-    ICMPv6EchoRequest,
-    IPv6,
-)
+from scapy.layers.inet6 import ICMPv6EchoReply, ICMPv6EchoRequest, IPv6
 from scapy.packet import Packet, Padding
 
 from parser.layers.ip import ones_complement_sum
+
+
+def _verify_ipv4_transport_checksum(
+    ip_layer: IP,
+    proto_num: int,
+    segment_bytes: bytes,
+    ip_len: int | None,
+) -> bool | None:
+    """Validate TCP/UDP checksum over an IPv4 pseudo-header."""
+    if int(ip_layer.flags or 0) & 0x01 or int(ip_layer.frag or 0) > 0:
+        return None
+    if ip_len is not None and len(bytes(ip_layer)) < ip_len:
+        return None
+    if proto_num == 17 and len(segment_bytes) >= 8:
+        udp_wire_chksum = struct.unpack_from("!H", segment_bytes, 6)[0]
+        if udp_wire_chksum == 0:
+            return None
+
+    src_bytes = ipaddress.IPv4Address(str(ip_layer.src)).packed
+    dst_bytes = ipaddress.IPv4Address(str(ip_layer.dst)).packed
+    pseudo = src_bytes + dst_bytes + struct.pack("!BBH", 0, proto_num, len(segment_bytes))
+    return ones_complement_sum(pseudo + segment_bytes) == 0xFFFF
+
+
+def _verify_ipv6_transport_checksum(
+    ip6_layer: IPv6,
+    proto_num: int,
+    segment_bytes: bytes,
+    ip_len: int | None,
+) -> bool | None:
+    """Validate TCP/UDP checksum over an IPv6 pseudo-header."""
+    if ip_len is not None and len(bytes(ip6_layer)) < ip_len:
+        return None
+    src_bytes = ipaddress.IPv6Address(str(ip6_layer.src)).packed
+    dst_bytes = ipaddress.IPv6Address(str(ip6_layer.dst)).packed
+    pseudo = (
+        src_bytes
+        + dst_bytes
+        + struct.pack("!IBBBB", len(segment_bytes), 0, 0, 0, proto_num)
+    )
+    return ones_complement_sum(pseudo + segment_bytes) == 0xFFFF
 
 
 def _verify_transport_checksum(
@@ -26,38 +63,10 @@ def _verify_transport_checksum(
     """Validate TCP/UDP checksum using IPv4 or IPv6 pseudo-header."""
     if not segment_bytes:
         return None
-
-    # Skip verification when payload was truncated/stripped (--no-payload / --payload-bytes)
-    # or when packet is fragmented (checksum spans the full reassembled datagram).
     if pkt.haslayer(IP):
-        ip_layer = pkt[IP]
-        if int(ip_layer.flags or 0) & 0x01 or int(ip_layer.frag or 0) > 0:
-            return None
-        if ip_len is not None and len(bytes(ip_layer)) < ip_len:
-            return None
-        if proto_num == 17 and len(segment_bytes) >= 8:
-            udp_wire_chksum = struct.unpack_from("!H", segment_bytes, 6)[0]
-            if udp_wire_chksum == 0:
-                return None
-        src_bytes = ipaddress.IPv4Address(str(ip_layer.src)).packed
-        dst_bytes = ipaddress.IPv4Address(str(ip_layer.dst)).packed
-        pseudo = src_bytes + dst_bytes + struct.pack("!BBH", 0, proto_num, len(segment_bytes))
-        return ones_complement_sum(pseudo + segment_bytes) == 0xFFFF
-
+        return _verify_ipv4_transport_checksum(pkt[IP], proto_num, segment_bytes, ip_len)
     if pkt.haslayer(IPv6):
-        ip6_layer = pkt[IPv6]
-        if ip_len is not None and len(bytes(ip6_layer)) < ip_len:
-            return None
-        src_bytes = ipaddress.IPv6Address(str(ip6_layer.src)).packed
-        dst_bytes = ipaddress.IPv6Address(str(ip6_layer.dst)).packed
-        # IPv6 pseudo-header places 3 zero bytes before next-header byte.
-        pseudo = (
-            src_bytes
-            + dst_bytes
-            + struct.pack("!IBBBB", len(segment_bytes), 0, 0, 0, proto_num)
-        )
-        return ones_complement_sum(pseudo + segment_bytes) == 0xFFFF
-
+        return _verify_ipv6_transport_checksum(pkt[IPv6], proto_num, segment_bytes, ip_len)
     return None
 
 
@@ -102,7 +111,6 @@ def parse_tcp(
     if ip_len is not None and ip_header_len is not None:
         expected_payload_len = max(0, ip_len - ip_header_len - data_offset)
 
-    # Trim Ethernet padding from segment_bytes before pseudo-header checksum check.
     expected_tcp_len = (
         data_offset + expected_payload_len if expected_payload_len is not None else None
     )
@@ -156,7 +164,6 @@ def parse_icmp(pkt: Packet) -> dict[str, Any]:
     if pkt.haslayer(ICMP):
         icmp = pkt[ICMP]
         raw_icmp = bytes(icmp)
-        # Reuse ones_complement_sum for ICMPv4 header+payload check.
         chksum_valid = ones_complement_sum(raw_icmp) == 0xFFFF if raw_icmp else None
         return {
             "transport_proto": "ICMP",

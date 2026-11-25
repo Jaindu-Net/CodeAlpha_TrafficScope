@@ -8,6 +8,7 @@ from collections import Counter, deque
 from typing import Any
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header
 
@@ -97,74 +98,81 @@ class DashboardState:
                 self.end_time = time.monotonic()
             self.capture_complete = True
 
+    def _core_snapshot_locked(self, now: float, since_alert_seq: int) -> dict[str, Any]:
+        """Build core counters and delta alerts while holding self._lock."""
+        end_ref = self.end_time if self.end_time is not None else now
+        elapsed_s = max(0.0, end_ref - self.start_time)
+
+        cutoff = now - 1.0
+        while self._pps_timestamps and self._pps_timestamps[0] < cutoff:
+            self._pps_timestamps.popleft()
+        current_pps = float(len(self._pps_timestamps))
+        avg_pps = self.total_packets / elapsed_s if elapsed_s > 0 else 0.0
+
+        unseen_count = max(0, self._alert_seq - since_alert_seq)
+        new_alerts = list(self.alerts)[-unseen_count:] if unseen_count > 0 else []
+
+        return {
+            "source_label": self.source_label,
+            "elapsed_s": elapsed_s,
+            "total_packets": self.total_packets,
+            "total_bytes": self.total_bytes,
+            "dropped_packets": self.dropped_packets,
+            "kernel_dropped": self.kernel_dropped,
+            "current_pps": current_pps,
+            "avg_pps": avg_pps,
+            "peak_pps": max(self.peak_pps, avg_pps),
+            "protocol_counts": dict(self.protocol_counts),
+            "top_ports": self.dst_port_counts.most_common(10),
+            "anomaly_counts": dict(self.anomaly_counts),
+            "total_anomalies": sum(self.anomaly_counts.values()),
+            "alert_seq": self._alert_seq,
+            "new_alerts": new_alerts,
+            "capture_complete": self.capture_complete,
+        }
+
+    def _collect_hosts(self) -> list[dict[str, Any]]:
+        """Gather top host summaries enriched with passive OS fingerprints."""
+        if self.flow_tracker is None:
+            return []
+        top_hosts = self.flow_tracker.get_host_summary(n=10)
+        if self.fingerprinter is None:
+            return top_hosts
+        for host in top_hosts:
+            host["os_guess"] = self.fingerprinter.get_os_guess(host["ip"])
+        return top_hosts
+
+    def _collect_entropy(self) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Summarize payload entropy distributions and top high-entropy flows."""
+        summary = {"plaintext": 0, "compressed/mixed": 0, "likely encrypted": 0}
+        if self.flow_tracker is None:
+            return [], summary
+
+        entropy_flows: list[dict[str, Any]] = []
+        for rec in self.flow_tracker.get_top_entropy_flows(n=100):
+            summary[rec.entropy_label] = summary.get(rec.entropy_label, 0) + 1
+            if len(entropy_flows) < 10:
+                entropy_flows.append(
+                    {
+                        "src_ip": rec.src_ip,
+                        "src_port": rec.src_port,
+                        "dst_ip": rec.dst_ip,
+                        "dst_port": rec.dst_port,
+                        "protocol": rec.protocol,
+                        "mean_entropy": rec.mean_entropy,
+                        "entropy_label": rec.entropy_label,
+                    }
+                )
+        return entropy_flows, summary
+
     def snapshot(self, *, since_alert_seq: int = 0) -> dict[str, Any]:
         """Return a consistent telemetry snapshot for UI rendering or exit reporting."""
         now = time.monotonic()
         with self._lock:
-            end_ref = self.end_time if self.end_time is not None else now
-            elapsed_s = max(0.0, end_ref - self.start_time)
+            snap = self._core_snapshot_locked(now, since_alert_seq)
 
-            cutoff = now - 1.0
-            while self._pps_timestamps and self._pps_timestamps[0] < cutoff:
-                self._pps_timestamps.popleft()
-            current_pps = float(len(self._pps_timestamps))
-            avg_pps = self.total_packets / elapsed_s if elapsed_s > 0 else 0.0
-
-            unseen_count = max(0, self._alert_seq - since_alert_seq)
-            if unseen_count > 0:
-                new_alerts = list(self.alerts)[-unseen_count:]
-            else:
-                new_alerts = []
-
-            snap: dict[str, Any] = {
-                "source_label": self.source_label,
-                "elapsed_s": elapsed_s,
-                "total_packets": self.total_packets,
-                "total_bytes": self.total_bytes,
-                "dropped_packets": self.dropped_packets,
-                "kernel_dropped": self.kernel_dropped,
-                "current_pps": current_pps,
-                "avg_pps": avg_pps,
-                "peak_pps": max(self.peak_pps, avg_pps),
-                "protocol_counts": dict(self.protocol_counts),
-                "top_ports": self.dst_port_counts.most_common(10),
-                "anomaly_counts": dict(self.anomaly_counts),
-                "total_anomalies": sum(self.anomaly_counts.values()),
-                "alert_seq": self._alert_seq,
-                "new_alerts": new_alerts,
-                "capture_complete": self.capture_complete,
-            }
-
-        top_hosts: list[dict[str, Any]] = []
-        entropy_flows: list[dict[str, Any]] = []
-        entropy_summary = {"plaintext": 0, "compressed/mixed": 0, "likely encrypted": 0}
-
-        if self.flow_tracker is not None:
-            top_hosts = self.flow_tracker.get_host_summary(n=10)
-            for host in top_hosts:
-                os_guess = (
-                    self.fingerprinter.get_os_guess(host["ip"])
-                    if self.fingerprinter is not None
-                    else None
-                )
-                host["os_guess"] = os_guess
-
-            for rec in self.flow_tracker.get_top_entropy_flows(n=100):
-                entropy_summary[rec.entropy_label] = entropy_summary.get(rec.entropy_label, 0) + 1
-                if len(entropy_flows) < 10:
-                    entropy_flows.append(
-                        {
-                            "src_ip": rec.src_ip,
-                            "src_port": rec.src_port,
-                            "dst_ip": rec.dst_ip,
-                            "dst_port": rec.dst_port,
-                            "protocol": rec.protocol,
-                            "mean_entropy": rec.mean_entropy,
-                            "entropy_label": rec.entropy_label,
-                        }
-                    )
-
-        snap["top_hosts"] = top_hosts
+        entropy_flows, entropy_summary = self._collect_entropy()
+        snap["top_hosts"] = self._collect_hosts()
         snap["entropy_flows"] = entropy_flows
         snap["entropy_summary"] = entropy_summary
         return snap
@@ -174,7 +182,7 @@ class TrafficScopeApp(App):
     """Live Textual terminal dashboard for TrafficScope."""
 
     TITLE = "TrafficScope"
-    BINDINGS = [("q", "quit_app", "Quit")]
+    BINDINGS = [Binding("q", "quit_app", "Quit", priority=True)]
 
     CSS = """
     Screen {
