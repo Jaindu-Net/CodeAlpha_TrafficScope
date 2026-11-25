@@ -1,12 +1,40 @@
 # TrafficScope
 
+> **Advanced Network Packet Sniffer, Stream Reconstructor & Passive Traffic Analyzer**
+
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 ![Platform Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6.svg)
 ![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
 
-**TrafficScope** is a multi-threaded Windows network sniffer and passive traffic analyzer built in Python 3.11+. Rather than simply dumping raw packet headers, it dissects traffic up to the application layer, defragments IP datagrams, reconstructs bidirectional TCP streams, detects protocol anomalies and passive scan signatures, profiles per-host statistical baselines and payload Shannon entropy, passively fingerprints operating systems, renders a live Textual TUI dashboard, and exports Wireshark-compatible PCAPs plus NetFlow-style JSON flow records.
+A multi-threaded Python network monitoring and traffic analysis application for Windows 10/11 that captures live traffic, reconstructs TCP sessions, dissects application protocols, profiles statistical baselines, passively fingerprints operating systems, and visualizes everything in a live terminal dashboard.
 
-> **Disclaimer:** TrafficScope is strictly for educational, diagnostic, and portfolio use on **your own machine or networks you explicitly own or have written authorization to monitor**. It operates purely passively and never transmits probe or active scan packets.
+---
+
+## Overview
+
+**TrafficScope** (developed for **CodeAlpha_TrafficScope**) goes beyond basic packet dumping by separating capture, protocol dissection, session reassembly, anomaly detection, statistical profiling, passive OS fingerprinting, visualization, and export into strictly decoupled modules around a non-blocking producer-consumer pipeline.
+
+> **Disclaimer:** This tool is strictly for authorized network diagnostics, educational learning, and portfolio use on **your own machine or networks you have explicit permission to monitor**. All detections are potential indicators for investigation—not confirmed attacks. TrafficScope operates purely passively and never transmits probe packets.
+
+---
+
+## Features
+
+### Core Capabilities
+
+- **Real-Time & Offline Packet Capture** — Live sniffing via Scapy + Npcap (`--iface`, `--filter`, `--count`, `--timeout`) plus admin-free PCAP replay (`--read`), with application queue and best-effort Npcap kernel drop counters
+- **Non-Blocking Producer-Consumer Pipeline** — Dedicated capture thread pushing into a bounded `queue.Queue(4096)` drained by `N` parallel `PipelineWorker` threads (`--threads`)
+- **Layer-by-Layer Protocol Dissection** — Ethernet/Loopback, IPv4/IPv6, TCP/UDP/ICMP/ICMPv6, plus application-layer metadata for **HTTP/1.x** (method, host, path, headers, status), **DNS** (UDP & TCP queries/answers), and **TLS `ClientHello`** (SNI & ALPN without decryption)
+- **IP Defragmentation & TCP Stream Reassembly** — Reassembles fragmented IPv4 datagrams (first-seen overlap policy) and out-of-order/retransmitted TCP segments into Wireshark-style conversations (`follow_stream()` and HTTP request/response reconstruction)
+- **Decoupled Anomaly & Passive Scan Detection** — Evaluates invalid checksums, impossible TTLs, malformed TCP flag scans (`NULL`, `FIN`, `XMAS`, `SYN+FIN`, reserved bits), SYN bursts, and port sweeps with per-source alert cooldown deduplication
+- **Statistical Traffic Profiling & Entropy** — Tracks rolling per-host packet rates (`HostProfiler` z-score deviations after `--baseline-seconds`) and byte-level payload **Shannon entropy** (`plaintext`, `compressed/mixed`, `likely encrypted`)
+- **Passive OS/Device Fingerprinting** — Maps observed TCP `SYN` TTL, window size, and TCP option ordering against an extendable JSON signature database (`fingerprint/db/fingerprints.json`)
+- **Wireshark & Flow Export** — Thread-safe libpcap `.pcap` writer (`--save`) plus versioned NetFlow-style JSON flow summaries (`<stem>_flows.json`)
+
+### Interfaces
+
+- **CLI Monitor & Exit Summary** — Colored Rich packet logging (`--verbose`) and structured shutdown report (throughput, queue/kernel drops, protocol breakdown, top talkers, top ports, anomalies, and entropy distribution)
+- **Live Textual TUI Dashboard** — Interactive full-screen terminal dashboard (`--dashboard`) with real-time panels refreshing every second
 
 ---
 
@@ -72,7 +100,7 @@ flowchart LR
 ### Prerequisites
 
 1. **Python 3.11+** (tested on Python 3.13.13, 64-bit Windows 11). Ensure **Add Python to PATH** is checked during installation.
-2. **Npcap**: Download from [npcap.com](https://npcap.com). During installation, check **"Install Npcap in WinPcap API-compatible Mode"** (required by Scapy on Windows).
+2. **Npcap**: Download from [npcap.com](https://npcap.com/#download). During installation, check **"Install Npcap in WinPcap API-compatible Mode"** (required by Scapy on Windows).
 3. **Administrator Terminal**: Live packet capture requires running Windows Terminal or PowerShell via **Run as administrator**. TrafficScope detects missing elevation at startup and exits with guidance. Offline `--read` replay, unit tests, and benchmarks do **not** require elevation.
 
 ### Installation
@@ -136,6 +164,39 @@ python main.py --iface "Wi-Fi" --timeout 60 --threads 2 --baseline-seconds 120 -
 
 ---
 
+## Dashboard
+
+Running with `--dashboard` opens the live **Textual** terminal interface, polling a thread-safe `DashboardState` snapshot every second (press `q` to quit cleanly and view the exit summary).
+
+### Dashboard Sections
+
+- **Header Status Bar** — Active interface/PCAP source, capture status (`LIVE` / `COMPLETE`), elapsed duration, live packets/sec, total packet count, and queue drops
+- **Protocol Breakdown** — Live packet counts and percentage shares across Ethernet, IP, transport, and application protocols
+- **Top Talkers** — Top 10 IP addresses ranked by byte volume alongside packet counts, primary protocol, and passive OS fingerprint guesses
+- **Payload Entropy Heatmap** — Visual 0–8 bits/byte heat bar classifying top payload flows as `plaintext` (green), `compressed/mixed` (yellow), or `likely encrypted` (red)
+- **Anomaly Feed** — Auto-scrolling severity-colored log (`HIGH` red, `MEDIUM` yellow, `LOW` dim) of triggered protocol and scan alerts
+
+---
+
+## Anomaly & Threat Detection Rules
+
+| Rule / Alert Type | Condition | Severity |
+| --- | --- | --- |
+| `INVALID_CHECKSUM` | IPv4 header or TCP/UDP/ICMP checksum fails RFC 1071 verification | `LOW` |
+| `TTL_ANOMALY` | Packet arrives with illegal `TTL=0` (`HIGH`) or unicast `TTL<=1` (`MEDIUM`) | `HIGH` / `MEDIUM` |
+| `SCAN_NULL` | TCP packet with zero classic control flags set | `MEDIUM` |
+| `SCAN_FIN` | TCP packet with only `FIN` set (no `ACK`) | `MEDIUM` |
+| `SCAN_XMAS` | TCP packet with `FIN+PSH+URG` set (no `ACK`) | `HIGH` |
+| `SYN_FIN_ILLEGAL` | Illegal TCP `SYN+FIN` flag combination | `HIGH` |
+| `RESERVED_FLAG` | Non-zero bits set in the TCP reserved header field | `MEDIUM` |
+| `SYN_FLOOD` | Same `(src_ip, dst_ip)` exceeds `--syn-threshold` (default `> 20`) unanswered SYNs in `10s` | `HIGH` |
+| `PORT_SWEEP` | Same `src_ip` touches more than `--port-threshold` (default `> 15`) distinct ports in `10s` | `HIGH` |
+| `STATISTICAL_ANOMALY` | Host 1s packet rate exceeds rolling baseline by `abs(z-score) > 2.5` after warmup | `MEDIUM` |
+
+All scan and statistical thresholds are configurable via CLI flags, and duplicate `(AlertType, src_ip)` alerts are rate-limited over a 60-second cooldown window.
+
+---
+
 ## Why TCP Reassembly & IP Defragmentation Are Needed
 
 Network traffic arrives as discrete frames, not tidy application messages:
@@ -174,7 +235,14 @@ Throughput peaks around **~3,805 pps** with 2 workers in the full pipeline (`~13
 All 40 automated unit and integration tests run without Administrator rights using synthetic Scapy-crafted packets:
 
 ```powershell
+# Run the full test suite
 pytest tests/ -v
+
+# Run tests for a specific module
+pytest tests/test_parser.py -v
+
+# Run the replay throughput benchmark
+python benchmark.py --generate 5000
 ```
 
 > **Note:** Live NIC capture and real `nmap` scan detection require running in an elevated Windows terminal with Npcap installed and are validated manually via the acceptance workflow.
@@ -185,10 +253,25 @@ pytest tests/ -v
 
 - **NIC Checksum Offloading (`INVALID_CHECKSUM`):** On Windows, outbound packets captured locally are often handed to Npcap before the NIC hardware computes IP/TCP checksums, causing `ChecksumRule` to flag legitimate locally originated packets with `LOW`-severity checksum alerts.
 - **Discovery Multicast & Background Chatter (`PORT_SWEEP` / `TTL_ANOMALY`):** `TTLRule` explicitly excludes multicast (`224.0.0.0/4`, `ff00::/8`) and link-local addresses so mDNS/SSDP `TTL=1` traffic does not alert. However, aggressive local service discovery or browser UDP traffic (e.g., QUIC/WebRTC opening many ephemeral ports) can trip low `--port-threshold` values.
+- **Encrypted DNS & TLS/QUIC Inspection Limits:** Passive inspection cannot decrypt **DNS over HTTPS (DoH)** or **DNS over TLS (DoT on port 853)** queries. Likewise, `tls_parser.py` extracts unencrypted `ClientHello` SNI/ALPN metadata over TCP (`443`/`8443`) and never attempts payload decryption; UDP-based QUIC Initial handshakes return `None` and are tracked as `UDP` with high Shannon entropy.
 - **Baseline Warmup (`HostProfiler`):** During `--baseline-seconds` (default `60s`), rate spikes are intentionally suppressed until sufficient per-second history (`min_history_seconds=5`) accumulates; a sudden burst within the first few seconds of capture will not trigger `STATISTICAL_ANOMALY`.
-- **Encrypted Payloads & QUIC/HTTP3:** `tls_parser.py` extracts unencrypted `ClientHello` SNI/ALPN metadata over TCP (`443`/`8443`) and never attempts decryption. UDP-based QUIC Initial handshakes return `None` from the TLS parser and are tracked as `UDP` with high Shannon entropy.
 - **Port-Based Application Dispatch:** HTTP/DNS/TLS sub-parsers trigger on standard port sets (`80/8080/3000/8000/8008`, `53/5353`, `443/8443`); HTTP running on unconventional ports will appear as raw `TCP` unless ports are customized.
 - **Advanced TCP Edge Cases:** `TCPReassembler` handles 32-bit sequence wraparound, out-of-order segments, retransmissions, and mid-stream prefix ordering, but does not interpret TCP SACK option blocks or TCP Fast Open data inside `SYN` frames.
+
+---
+
+## Technology Stack
+
+| Component | Technology |
+| --- | --- |
+| Packet Capture & PCAP I/O | `Scapy 2.8+` + `Npcap` (WinPcap-compatible mode) |
+| Live Dashboard & CLI UI | `Textual` + `Rich` |
+| Statistical Profiling & Entropy | `NumPy` + `Pandas` + `scikit-learn` |
+| Concurrency | Python `threading` + `queue.Queue` |
+| Passive OS Database | Local JSON (`fingerprint/db/fingerprints.json`) |
+| Flow Export | Versioned NetFlow-style JSON (`_schema_version: 1.0`) |
+| Testing | `pytest` (40 synthetic-packet tests) |
+| Language & Platform | Python 3.11+ on Windows 10/11 |
 
 ---
 
@@ -197,3 +280,18 @@ pytest tests/ -v
 - **Authorized Environments Only:** Run TrafficScope exclusively on loopback (`127.0.0.1`), personal lab VMs, or networks you own or have explicit written permission to inspect.
 - **Zero Active Probing:** TrafficScope never injects, crafts, modifies, or transmits network traffic—it inspects copies of frames already delivered to the local host interface.
 - **Privacy Awareness:** Packet payloads can contain sensitive tokens or credentials on unencrypted HTTP links. Use `--no-payload` or `--payload-bytes` when demonstrating or capturing in shared environments.
+
+---
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+---
+
+## Acknowledgments
+
+- **CodeAlpha** — Cyber Security Internship Program (`CodeAlpha_TrafficScope`)
+- **Scapy** — Packet manipulation, dissection, and PCAP tooling
+- **Textual & Rich** — Terminal user interface and formatted reporting
+- **NumPy** — Fast vectorized Shannon entropy and baseline statistics
