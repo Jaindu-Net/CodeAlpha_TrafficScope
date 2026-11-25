@@ -295,3 +295,12 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 - **Scapy** — Packet manipulation, dissection, and PCAP tooling
 - **Textual & Rich** — Terminal user interface and formatted reporting
 - **NumPy** — Fast vectorized Shannon entropy and baseline statistics
+
+---
+
+<!-- markdownlint-disable MD033 -->
+<div align="center">
+  <strong>Developed by Jaindu De Zoysa</strong><br />
+  CodeAlpha Cyber Security Internship — Task 01
+</div>
+<!-- markdownlint-enable MD033 -->
