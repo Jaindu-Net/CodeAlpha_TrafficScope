@@ -42,6 +42,33 @@ class HostBaseline:
         return {proto: count / total for proto, count in self.protocol_counts.items()}
 
 
+def _compute_payload_z_score(baseline: HostBaseline) -> float:
+    """Compute z-score of the newest payload size vs prior rolling payload history."""
+    if len(baseline.payload_sizes) < 11:
+        return 0.0
+    sizes = list(baseline.payload_sizes)
+    prior = np.asarray(sizes[:-1], dtype=np.float64)
+    current = float(sizes[-1])
+    mean_sz = float(np.mean(prior))
+    std_sz = float(np.std(prior))
+    if std_sz > 1.0:
+        return float((current - mean_sz) / std_sz)
+    if abs(current - mean_sz) < max(256.0, mean_sz * 2.0):
+        return 0.0
+    effective_std = max(64.0, mean_sz * 0.5)
+    return float((current - mean_sz) / effective_std)
+
+
+def _detect_protocol_shift(
+    baseline: HostBaseline,
+    current_proto: str | None,
+) -> bool:
+    """Return True if a brand-new protocol appears after an established baseline."""
+    if current_proto is None or baseline.total_packets < 25:
+        return False
+    return baseline.protocol_counts.get(current_proto, 0) == 1
+
+
 class HostProfiler:
     """Maintains rolling per-host traffic baselines and flags statistical shifts."""
 
@@ -75,7 +102,7 @@ class HostProfiler:
         self._lock = threading.Lock()
         self._hosts: dict[str, HostBaseline] = {}
         self._start_time: float | None = None
-        self._flagged_seconds: set[tuple[str, int]] = set()
+        self._flagged_events: set[tuple[str, int, str]] = set()
 
     def update(self, pkt: ParsedPacket) -> dict[str, Any] | None:
         """Record packet telemetry for pkt.ip_src and return deviation info if anomalous."""
@@ -84,6 +111,7 @@ class HostProfiler:
 
         now = pkt.timestamp
         sec = int(now)
+        proto = pkt.effective_protocol
 
         with self._lock:
             if self._start_time is None:
@@ -103,9 +131,8 @@ class HostProfiler:
             baseline.total_packets += 1
             baseline.total_bytes += pkt.packet_len
             baseline.payload_sizes.append(len(pkt.payload_bytes))
-            baseline.protocol_counts[pkt.effective_protocol] += 1
+            baseline.protocol_counts[proto] += 1
 
-            # Update 1-second rate bucket.
             if baseline.second_buckets and baseline.second_buckets[-1][0] == sec:
                 baseline.second_buckets[-1][1] += 1
             else:
@@ -115,14 +142,16 @@ class HostProfiler:
             while baseline.second_buckets and baseline.second_buckets[0][0] < cutoff_sec:
                 baseline.second_buckets.popleft()
 
-            deviation = self._compute_deviation_locked(baseline, now, sec)
-            if deviation is not None and deviation["flagged"]:
-                flag_key = (pkt.ip_src, sec)
-                if flag_key in self._flagged_seconds:
-                    return None
-                self._flagged_seconds.add(flag_key)
-                return deviation
-            return None
+            deviation = self._compute_deviation_locked(baseline, now, sec, proto)
+            if deviation is None or not deviation["flagged"]:
+                return None
+
+            reason_key = ",".join(deviation["reasons"])
+            flag_key = (pkt.ip_src, sec, reason_key)
+            if flag_key in self._flagged_events:
+                return None
+            self._flagged_events.add(flag_key)
+            return deviation
 
     def get_deviation(self, ip: str, now: float | None = None) -> dict[str, Any] | None:
         """Return rolling mean, std, current pps, and z-score for a tracked host."""
@@ -131,15 +160,14 @@ class HostProfiler:
             if baseline is None or not baseline.second_buckets:
                 return None
             ref_time = now if now is not None else baseline.last_seen
-            return self._compute_deviation_locked(baseline, ref_time, int(ref_time))
+            return self._compute_deviation_locked(baseline, ref_time, int(ref_time), None)
 
-    def _compute_deviation_locked(
+    def _compute_pps_stats(
         self,
         baseline: HostBaseline,
-        now: float,
         current_sec: int,
-    ) -> dict[str, Any] | None:
-        """Evaluate z-score of the current 1s packet rate against prior baseline buckets."""
+    ) -> tuple[int, float, float, float] | None:
+        """Return (current_pps, mean_pps, std_pps, z_score) or None if insufficient history."""
         if len(baseline.second_buckets) < 2:
             return None
 
@@ -160,19 +188,45 @@ class HostProfiler:
         std_pps = float(np.std(arr))
         effective_std = std_pps if std_pps > 0.05 else max(0.5, mean_pps * 0.25)
         z_score = float((current_pps - mean_pps) / effective_std)
+        return current_pps, mean_pps, std_pps, z_score
 
-        elapsed_learning = (
-            (now - self._start_time) if self._start_time is not None else 0.0
-        )
+    def _compute_deviation_locked(
+        self,
+        baseline: HostBaseline,
+        now: float,
+        current_sec: int,
+        current_proto: str | None,
+    ) -> dict[str, Any] | None:
+        """Evaluate PPS, payload-size, and protocol-mix deviations."""
+        pps_stats = self._compute_pps_stats(baseline, current_sec)
+        if pps_stats is None:
+            return None
+
+        current_pps, mean_pps, std_pps, z_score = pps_stats
+        payload_z = _compute_payload_z_score(baseline)
+        proto_shift = _detect_protocol_shift(baseline, current_proto)
+
+        elapsed_learning = (now - self._start_time) if self._start_time is not None else 0.0
         warmup_done = elapsed_learning >= self.baseline_seconds
-        flagged = warmup_done and abs(z_score) > self.z_threshold
 
+        reasons: list[str] = []
+        if abs(z_score) > self.z_threshold:
+            reasons.append("pps_spike")
+        if abs(payload_z) > self.z_threshold:
+            reasons.append("payload_size_shift")
+        if proto_shift:
+            reasons.append("protocol_shift")
+
+        flagged = warmup_done and bool(reasons)
         return {
             "ip": baseline.ip,
             "current_pps": current_pps,
             "mean_pps": mean_pps,
             "std_pps": std_pps,
             "z_score": z_score,
+            "payload_z_score": payload_z,
+            "protocol_shift": proto_shift,
+            "reasons": reasons,
             "mean_payload_size": baseline.mean_payload_size,
             "protocol_mix": baseline.protocol_mix,
             "warmup_complete": warmup_done,

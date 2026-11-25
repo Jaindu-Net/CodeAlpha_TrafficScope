@@ -17,6 +17,7 @@ class DirectionBuffer:
     isn_anchored: bool = False
     reassembled: bytearray = field(default_factory=bytearray)
     pending: list[tuple[int, bytes]] = field(default_factory=list)
+    pre_pending: list[tuple[int, bytes]] = field(default_factory=list)
     retransmissions: int = 0
     out_of_order_count: int = 0
 

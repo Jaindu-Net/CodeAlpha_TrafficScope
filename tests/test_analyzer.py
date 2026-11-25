@@ -68,6 +68,12 @@ def test_flag_rules_trigger_on_null_fin_xmas_synfin_and_reserved() -> None:
     res_alerts = detector.inspect(parser.parse(reserved_pkt))
     assert any(a.type == AlertType.RESERVED_FLAG for a in res_alerts)
 
+    # Half-ECN SYN (ECE without CWR) is malformed; valid ECN SYN+ECE+CWR is normal.
+    half_ecn = parser.parse(make_tcp_segment(flags="SE"))
+    assert any(a.type == AlertType.RESERVED_FLAG for a in detector.inspect(half_ecn))
+    valid_ecn = parser.parse(make_tcp_segment(flags="SEC"))
+    assert not any(a.type == AlertType.RESERVED_FLAG for a in detector.inspect(valid_ecn))
+
 
 def test_scan_detector_flags_syn_flood_and_port_sweep() -> None:
     parser = PacketParser()

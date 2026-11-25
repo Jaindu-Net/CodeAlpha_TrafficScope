@@ -165,20 +165,58 @@ class TCPReassembler:
         if (flags & _FLAG_ACK) and stream.state == "SYN_SEEN":
             stream.state = "ESTABLISHED"
 
+    def _buffer_pre_pending(self, dir_buf: DirectionBuffer, seq: int, payload: bytes) -> None:
+        """Store detached earlier segments arriving mid-stream before base_seq."""
+        assert dir_buf.base_seq is not None
+        dir_buf.out_of_order_count += 1
+        pending_total = sum(len(item[1]) for item in dir_buf.pre_pending)
+        if pending_total + len(payload) > _MAX_PENDING_BYTES_PER_DIRECTION:
+            return
+        if any(ex_seq == seq and ex_data == payload for ex_seq, ex_data in dir_buf.pre_pending):
+            dir_buf.retransmissions += 1
+            return
+        dir_buf.pre_pending.append((seq, payload))
+        dir_buf.pre_pending.sort(
+            key=lambda item: _seq_diff(
+                (item[0] + len(item[1])) & 0xFFFFFFFF, dir_buf.base_seq or 0
+            ),
+            reverse=True,
+        )
+
+    def _drain_pre_pending(self, dir_buf: DirectionBuffer, prefix_parts: list[bytes]) -> None:
+        """Prepend any buffered earlier mid-stream segments now contiguous with base_seq."""
+        assert dir_buf.base_seq is not None
+        while dir_buf.pre_pending:
+            seg_seq, seg_data = dir_buf.pre_pending[0]
+            seg_end = (seg_seq + len(seg_data)) & 0xFFFFFFFF
+            end_diff = _seq_diff(seg_end, dir_buf.base_seq)
+            if end_diff < 0:
+                break
+            dir_buf.pre_pending.pop(0)
+            if _seq_diff(seg_seq, dir_buf.base_seq) >= 0:
+                dir_buf.retransmissions += 1
+                continue
+            chunk_len = _seq_diff(dir_buf.base_seq, seg_seq)
+            chunk = seg_data[:chunk_len]
+            dir_buf.reassembled = bytearray(chunk) + dir_buf.reassembled
+            dir_buf.base_seq = seg_seq
+            prefix_parts.insert(0, chunk)
+
     def _handle_midstream_prefix(
         self,
         dir_buf: DirectionBuffer,
         seq: int,
         payload: bytes,
     ) -> tuple[bytes, bool] | None:
-        """Prepend earlier out-of-order prefix when capture started mid-stream."""
+        """Handle segments arriving before base_seq when capture started mid-stream."""
         assert dir_buf.base_seq is not None and dir_buf.next_seq is not None
         if dir_buf.isn_anchored or _seq_diff(seq, dir_buf.base_seq) >= 0:
             return None
 
         end_offset = _seq_diff((seq + len(payload)) & 0xFFFFFFFF, dir_buf.base_seq)
         if end_offset < 0:
-            return None
+            self._buffer_pre_pending(dir_buf, seq, payload)
+            return b"", False
 
         prefix_len = _seq_diff(dir_buf.base_seq, seq)
         prefix = payload[:prefix_len]
@@ -191,7 +229,10 @@ class TCPReassembler:
             tail = payload[len(payload) - tail_offset:]
             dir_buf.reassembled.extend(tail)
             dir_buf.next_seq = (dir_buf.next_seq + len(tail)) & 0xFFFFFFFF
-        return prefix, True
+
+        prefix_parts = [prefix]
+        self._drain_pre_pending(dir_buf, prefix_parts)
+        return b"".join(prefix_parts), True
 
     def _buffer_out_of_order(
         self,
@@ -294,12 +335,7 @@ class TCPReassembler:
             stream = self.store.get(flow_key)
             if stream is None:
                 return ""
-            lines: list[str] = []
-            for direction, chunk in stream.conversation:
-                prefix = "→ CLIENT" if direction == "CLIENT" else "← SERVER"
-                text = chunk.decode("utf-8", errors="replace")
-                lines.append(f"[{prefix}]\n{text}")
-            return "\n".join(lines)
+            return _format_conversation(stream.conversation)
 
     def get_http_exchange(self, flow_key: FlowKey) -> dict[str, Any] | None:
         """Attempt HTTP request and response parsing on reassembled stream buffers."""
@@ -315,3 +351,38 @@ class TCPReassembler:
         if req is None and resp is None:
             return None
         return {"request": req, "response": resp}
+
+    def get_all_http_exchanges(self) -> list[dict[str, Any]]:
+        """Return reconstructed HTTP exchanges across all tracked streams."""
+        exchanges: list[dict[str, Any]] = []
+        for stream in self.store.all_streams():
+            exchange = self.get_http_exchange(stream.flow_key)
+            if exchange is not None:
+                exchanges.append(
+                    {
+                        "flow_key": stream.flow_key,
+                        "client": stream.client_endpoint,
+                        "server": stream.server_endpoint,
+                        "request": exchange["request"],
+                        "response": exchange["response"],
+                    }
+                )
+        return exchanges
+
+    def get_all_streams_text(self) -> list[tuple[FlowKey, str]]:
+        """Return formatted conversation strings for all non-empty streams."""
+        results: list[tuple[FlowKey, str]] = []
+        for stream in self.store.all_streams():
+            if stream.conversation:
+                results.append((stream.flow_key, _format_conversation(stream.conversation)))
+        return results
+
+
+def _format_conversation(conversation: list[tuple[str, bytes]]) -> str:
+    """Format directional byte chunks into a readable transcript."""
+    lines: list[str] = []
+    for direction, chunk in conversation:
+        prefix = "→ CLIENT" if direction == "CLIENT" else "← SERVER"
+        text = chunk.decode("utf-8", errors="replace")
+        lines.append(f"[{prefix}]\n{text}")
+    return "\n".join(lines)

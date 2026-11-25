@@ -1,10 +1,10 @@
 # TrafficScope Benchmark Results
 
-- **Run Date:** 2026-11-25 11:05 UTC
+- **Run Date:** 2026-11-25 14:48 UTC
 - **OS:** Windows-11-10.0.26200-SP0
 - **Python:** 3.13.13
 - **Logical CPUs:** 16
-- **Test Dataset:** Synthetic Mixed PCAP (5,000 pkts) (5,000 packets)
+- **Test Dataset:** Synthetic Mixed PCAP (5,000 packets)
 
 ## Methodology
 
@@ -15,7 +15,7 @@
 
 | Mode | Workers | Packets | Duration (s) | Sustained Throughput (pps) | MB/s |
 |---|---:|---:|---:|---:|---:|
-| Raw `PacketParser` Loop | 1 | 5,000 | 0.378 | 13,215.4 | 0.95 |
-| Full Analysis Pipeline | 1 | 5,000 | 1.366 | 3,660.8 | 0.26 |
-| Full Analysis Pipeline | 2 | 5,000 | 1.314 | 3,805.3 | 0.27 |
-| Full Analysis Pipeline | 4 | 5,000 | 1.387 | 3,605.2 | 0.26 |
+| Raw `PacketParser` Loop | 1 | 5,000 | 0.407 | 12,274.0 | 0.88 |
+| Full Analysis Pipeline | 1 | 5,000 | 1.480 | 3,378.4 | 0.24 |
+| Full Analysis Pipeline | 2 | 5,000 | 1.391 | 3,594.9 | 0.26 |
+| Full Analysis Pipeline | 4 | 5,000 | 1.471 | 3,399.4 | 0.24 |

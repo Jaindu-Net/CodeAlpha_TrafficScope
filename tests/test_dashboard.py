@@ -7,7 +7,7 @@ from io import StringIO
 from rich.console import Console
 
 from analyzer import AnomalyDetector
-from dashboard import DashboardState, TrafficScopeApp, print_exit_report
+from dashboard import DashboardState, TrafficScopeApp, print_exit_report, print_followed_streams
 from dashboard.widgets.anomaly_feed import AnomalyFeed
 from dashboard.widgets.entropy_panel import EntropyPanel, _entropy_heat_bar
 from dashboard.widgets.protocol_table import ProtocolTable
@@ -45,12 +45,17 @@ def test_dashboard_state_and_exit_report_rendering() -> None:
     buf = StringIO()
     console = Console(file=buf, force_terminal=False, width=100)
     print_exit_report(snap, console=console)
+    print_followed_streams(
+        [(("192.168.1.10", 52000, "93.184.216.34", 80, "TCP"), "[→ CLIENT]\nGET / HTTP/1.1")],
+        console=console,
+    )
     rendered = buf.getvalue()
     assert "TrafficScope Session Summary" in rendered
     assert "Protocol Breakdown" in rendered
     assert "Top Talkers" in rendered
     assert "SCAN_XMAS" in rendered
     assert "Windows 10/11" in rendered
+    assert "Follow TCP Stream" in rendered
 
 
 def test_dashboard_widgets_and_app_init_synchronously() -> None:

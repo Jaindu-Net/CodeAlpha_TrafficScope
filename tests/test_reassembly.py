@@ -123,6 +123,26 @@ def test_tcp_follow_stream_and_http_exchange_reconstruction() -> None:
     assert exchange["response"]["status_code"] == 200
     assert exchange["response"]["body"] == b"ok-body"
 
+    all_exchanges = reassembler.get_all_http_exchanges()
+    assert len(all_exchanges) == 1
+    assert all_exchanges[0]["flow_key"] == req1.flow_key
+
+
+def test_tcp_three_chunk_reverse_midstream_reassembly() -> None:
+    parser = PacketParser()
+    reassembler = TCPReassembler()
+
+    s1 = parser.parse(make_tcp_segment(sport=53333, seq=100, payload=b"PART1-"))
+    s2 = parser.parse(make_tcp_segment(sport=53333, seq=106, payload=b"PART2-"))
+    s3 = parser.parse(make_tcp_segment(sport=53333, seq=112, payload=b"PART3"))
+
+    # Deliver s3, then detached s1 (gap before s3), then s2 closing the gap.
+    reassembler.add_segment(s3)
+    reassembler.add_segment(s1)
+    reassembler.add_segment(s2)
+
+    assert reassembler.get_stream_data(s1.flow_key, direction="client") == b"PART1-PART2-PART3"
+
 
 def test_tcp_stream_idle_expiry() -> None:
     parser = PacketParser()

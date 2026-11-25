@@ -25,10 +25,16 @@ from capture import (
     select_interface,
     warn_if_not_elevated,
 )
-from dashboard import DashboardState, TrafficScopeApp, print_exit_report
+from dashboard import (
+    DashboardState,
+    TrafficScopeApp,
+    print_exit_report,
+    print_followed_streams,
+)
 from export import FlowExporter, PcapWriter
 from fingerprint import Fingerprinter
 from parser import PacketParser, ParsedPacket
+from parser.layers.application import DEFAULT_HTTP_PORTS
 from profiler import FlowTracker, HostProfiler
 from reassembly import IPDefragmenter, TCPReassembler
 
@@ -125,7 +131,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--z-threshold",
         type=float,
         default=2.5,
-        help="Absolute z-score threshold for host rate deviation alerts.",
+        help="Absolute z-score threshold for host rate/payload deviation alerts.",
+    )
+    parser.add_argument(
+        "--http-ports",
+        type=str,
+        default=None,
+        help="Comma-separated TCP ports dissected as HTTP (default: 80,8080,3000,8000,8008).",
+    )
+    parser.add_argument(
+        "--follow-streams",
+        action="store_true",
+        help="Print reconstructed TCP stream conversations at exit.",
     )
     parser.add_argument(
         "--verbose",
@@ -226,6 +243,7 @@ class PipelineWorker(threading.Thread):
 
 def _build_statistical_alert(pkt: ParsedPacket, deviation: dict[str, Any]) -> Alert:
     """Create a STATISTICAL_ANOMALY alert from a HostProfiler deviation dict."""
+    reasons = ", ".join(deviation.get("reasons", ())) or "rate_shift"
     return Alert(
         timestamp=pkt.timestamp,
         type=AlertType.STATISTICAL_ANOMALY,
@@ -233,12 +251,33 @@ def _build_statistical_alert(pkt: ParsedPacket, deviation: dict[str, Any]) -> Al
         src_ip=pkt.ip_src,
         dst_ip=pkt.ip_dst,
         detail=(
-            f"Traffic rate deviation for {pkt.ip_src}: "
-            f"z={deviation['z_score']:.2f} "
+            f"Behavioral deviation ({reasons}) for {pkt.ip_src}: "
+            f"pps_z={deviation['z_score']:.2f}, "
+            f"payload_z={deviation.get('payload_z_score', 0.0):.2f} "
             f"({deviation['current_pps']} pps vs mean {deviation['mean_pps']:.1f})"
         ),
         raw_context=deviation,
     )
+
+
+def _parse_ports_arg(raw: str | None) -> frozenset[int]:
+    """Parse a comma-separated port list string into validated TCP/UDP port numbers."""
+    if raw is None or not raw.strip():
+        return DEFAULT_HTTP_PORTS
+    ports: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(f"Invalid port number in --http-ports: {token!r}")
+        port = int(token)
+        if not (1 <= port <= 65535):
+            raise ValueError(f"Port out of range (1-65535): {port}")
+        ports.add(port)
+    if not ports:
+        raise ValueError("--http-ports cannot be empty.")
+    return frozenset(ports)
 
 
 def _derive_flows_json_path(pcap_path: str) -> Path:
@@ -255,6 +294,7 @@ class _PipelineRuntime:
     packet_queue: queue.Queue[Packet]
     stop_event: threading.Event
     producer_done: threading.Event
+    reassembler: TCPReassembler
     flow_tracker: FlowTracker
     pcap_writer: PcapWriter | None
     dashboard_state: DashboardState
@@ -278,12 +318,13 @@ def _resolve_capture_source(args: argparse.Namespace, out: Console) -> tuple[boo
 
 def _start_pipeline(args: argparse.Namespace, out: Console) -> _PipelineRuntime:
     """Instantiate all pipeline modules, workers, and capture/replay producer."""
+    http_ports = _parse_ports_arg(args.http_ports)
     is_offline, target_iface, source_label = _resolve_capture_source(args, out)
     packet_queue: queue.Queue[Packet] = queue.Queue(maxsize=4096)
     stop_event = threading.Event()
     producer_done = threading.Event()
 
-    parser = PacketParser()
+    parser = PacketParser(http_ports=http_ports)
     defragmenter = IPDefragmenter(parser=parser)
     reassembler = TCPReassembler()
     detector = AnomalyDetector(
@@ -370,6 +411,7 @@ def _start_pipeline(args: argparse.Namespace, out: Console) -> _PipelineRuntime:
         packet_queue=packet_queue,
         stop_event=stop_event,
         producer_done=producer_done,
+        reassembler=reassembler,
         flow_tracker=flow_tracker,
         pcap_writer=pcap_writer,
         dashboard_state=dashboard_state,
@@ -482,7 +524,10 @@ def run_session(args: argparse.Namespace, *, console: Console | None = None) -> 
         raise rt.producer_error[0]
 
     summary_snap = rt.dashboard_state.snapshot()
+    summary_snap["http_exchanges"] = rt.reassembler.get_all_http_exchanges()
     print_exit_report(summary_snap, console=out)
+    if args.follow_streams:
+        print_followed_streams(rt.reassembler.get_all_streams_text(), console=out)
     return summary_snap
 
 

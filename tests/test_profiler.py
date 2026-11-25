@@ -107,3 +107,56 @@ def test_host_profiler_respects_learning_period_and_flags_spike() -> None:
     assert flagged_event["flagged"] is True
     assert flagged_event["z_score"] == pytest.approx(flagged_event["z_score"])
     assert flagged_event["z_score"] > 2.5
+    assert "pps_spike" in flagged_event["reasons"]
+
+
+def test_host_profiler_flags_payload_size_and_protocol_shifts() -> None:
+    parser = PacketParser()
+    profiler = HostProfiler(
+        baseline_seconds=10.0,
+        window_seconds=60,
+        z_threshold=2.5,
+        min_history_seconds=5,
+    )
+
+    # 25 baseline TCP packets across 25 seconds with small 8-byte payloads.
+    for sec in range(25):
+        pkt = parser.parse(
+            make_tcp_segment(
+                src="10.0.0.44",
+                sport=50000,
+                dport=9000,
+                payload=b"12345678",
+                timestamp=2000.0 + sec,
+            )
+        )
+        assert profiler.update(pkt) is None
+
+    # Sudden 1200-byte payload size jump on same protocol -> payload_size_shift
+    big_pkt = parser.parse(
+        make_tcp_segment(
+            src="10.0.0.44",
+            sport=50000,
+            dport=9000,
+            payload=b"Z" * 1200,
+            timestamp=2025.0,
+        )
+    )
+    payload_dev = profiler.update(big_pkt)
+    assert payload_dev is not None
+    assert "payload_size_shift" in payload_dev["reasons"]
+
+    # Sudden brand-new HTTP protocol on next second -> protocol_shift
+    http_pkt = parser.parse(make_http_request_pkt(src="10.0.0.44", sport=50001, dport=80))
+    http_pkt_ts = parser.parse(
+        make_tcp_segment(
+            src="10.0.0.44",
+            sport=50001,
+            dport=80,
+            payload=http_pkt.payload_bytes,
+            timestamp=2026.0,
+        )
+    )
+    proto_dev = profiler.update(http_pkt_ts)
+    assert proto_dev is not None
+    assert "protocol_shift" in proto_dev["reasons"]

@@ -119,6 +119,51 @@ def _render_entropy_summary(entropy_summary: dict[str, int], out: Console) -> No
     out.print(table)
 
 
+def _render_http_exchanges(http_exchanges: list[dict[str, Any]], out: Console) -> None:
+    """Render reconstructed HTTP request/response sessions from TCP reassembly."""
+    if not http_exchanges:
+        return
+    table = Table(title="Reconstructed HTTP Sessions")
+    table.add_column("Client -> Server", style="bold green")
+    table.add_column("Method", style="cyan")
+    table.add_column("Host")
+    table.add_column("Path")
+    table.add_column("Status", justify="right", style="yellow")
+    table.add_column("Body", justify="right")
+
+    for item in http_exchanges[:10]:
+        req = item.get("request") or {}
+        resp = item.get("response") or {}
+        client = item.get("client", ("?", 0))
+        server = item.get("server", ("?", 0))
+        endpoint = f"{client[0]}:{client[1]} -> {server[0]}:{server[1]}"
+        body_len = len(resp.get("body", b"")) if resp else len(req.get("body", b""))
+        table.add_row(
+            endpoint,
+            str(req.get("method") or "—"),
+            str(req.get("host") or "—"),
+            str(req.get("path") or "—"),
+            str(resp.get("status_code") or "—"),
+            format_bytes(body_len),
+        )
+    out.print(table)
+
+
+def print_followed_streams(
+    streams: list[tuple[Any, str]],
+    console: Console | None = None,
+    *,
+    max_streams: int = 10,
+) -> None:
+    """Render Wireshark-style Follow TCP Stream transcripts."""
+    if not streams:
+        return
+    out = console or Console()
+    for flow_key, transcript in streams[:max_streams]:
+        title = f"Follow TCP Stream {flow_key}"
+        out.print(Panel(transcript, title=title, border_style="green"))
+
+
 def print_exit_report(stats: dict[str, Any], console: Console | None = None) -> None:
     """Print TrafficScope capture summary, top IPs/ports, anomalies, and throughput."""
     out = console or Console()
@@ -126,5 +171,6 @@ def print_exit_report(stats: dict[str, Any], console: Console | None = None) -> 
     _render_protocol_table(stats.get("protocol_counts", {}), out)
     _render_top_hosts(stats.get("top_hosts", []), out)
     _render_top_ports(stats.get("top_ports", []), out)
+    _render_http_exchanges(stats.get("http_exchanges", []), out)
     _render_anomalies(stats.get("anomaly_counts", {}), out)
     _render_entropy_summary(stats.get("entropy_summary", {}), out)

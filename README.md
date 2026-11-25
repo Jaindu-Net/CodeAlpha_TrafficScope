@@ -137,11 +137,14 @@ python main.py --iface "Wi-Fi" --dashboard
 # Capture HTTP traffic, save PCAP + *_flows.json, stop after 1,000 packets
 python main.py --iface "Ethernet" --filter "tcp port 80" --save capture.pcap --count 1000
 
+# Replay an existing PCAP offline with reconstructed HTTP stream transcripts
+python main.py --read capture.pcap --follow-streams
+
 # Replay an existing PCAP offline with the dashboard (no admin needed)
 python main.py --read capture.pcap --dashboard
 
-# Run 60-second capture with 2 workers, 120s baseline learning window, and verbose output
-python main.py --iface "Wi-Fi" --timeout 60 --threads 2 --baseline-seconds 120 --verbose
+# Capture HTTP on custom port 8888 for 60s with 2 workers and 120s baseline learning
+python main.py --iface "Wi-Fi" --http-ports 80,8080,8888 --timeout 60 --threads 2 --baseline-seconds 120 --verbose
 ```
 
 | Flag | Default | Description |
@@ -159,7 +162,9 @@ python main.py --iface "Wi-Fi" --timeout 60 --threads 2 --baseline-seconds 120 -
 | `--baseline-seconds` | `60.0` | Warmup period before flagging host traffic rate z-score deviations |
 | `--syn-threshold` | `20` | Unanswered SYNs per 10s window before flagging `SYN_FLOOD` |
 | `--port-threshold` | `15` | Distinct destination ports per 10s window before flagging `PORT_SWEEP` |
-| `--z-threshold` | `2.5` | Absolute z-score threshold for host statistical rate shifts |
+| `--z-threshold` | `2.5` | Absolute z-score threshold for host rate/payload deviation alerts |
+| `--http-ports` | `80,8080,3000,8000,8008` | Comma-separated TCP ports dissected as HTTP |
+| `--follow-streams` | `False` | Print reconstructed TCP stream conversations at exit |
 | `--verbose` | `False` | Print dissected packet summaries and live alerts in CLI mode |
 
 ---
@@ -191,7 +196,7 @@ Running with `--dashboard` opens the live **Textual** terminal interface, pollin
 | `RESERVED_FLAG` | Non-zero bits set in the TCP reserved header field | `MEDIUM` |
 | `SYN_FLOOD` | Same `(src_ip, dst_ip)` exceeds `--syn-threshold` (default `> 20`) unanswered SYNs in `10s` | `HIGH` |
 | `PORT_SWEEP` | Same `src_ip` touches more than `--port-threshold` (default `> 15`) distinct ports in `10s` | `HIGH` |
-| `STATISTICAL_ANOMALY` | Host 1s packet rate exceeds rolling baseline by `abs(z-score) > 2.5` after warmup | `MEDIUM` |
+| `STATISTICAL_ANOMALY` | Host 1s rate or payload size exceeds rolling baseline by `abs(z-score) > 2.5`, or unseen protocol appears after warmup | `MEDIUM` |
 
 All scan and statistical thresholds are configurable via CLI flags, and duplicate `(AlertType, src_ip)` alerts are rate-limited over a 60-second cooldown window.
 
@@ -219,20 +224,20 @@ Measured locally via `python benchmark.py --generate 5000` (see [docs/benchmark_
 
 | Mode | Workers | Packets | Duration (s) | Sustained Throughput (pps) | MB/s |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Raw `PacketParser` Loop | 1 | 5,000 | 0.378 | **13,215.4** | 0.95 |
-| Full Analysis Pipeline | 1 | 5,000 | 1.366 | 3,660.8 | 0.26 |
-| Full Analysis Pipeline | 2 | 5,000 | 1.314 | **3,805.3** | 0.27 |
-| Full Analysis Pipeline | 4 | 5,000 | 1.387 | 3,605.2 | 0.26 |
+| Raw `PacketParser` Loop | 1 | 5,000 | 0.407 | **12,274.0** | 0.88 |
+| Full Analysis Pipeline | 1 | 5,000 | 1.480 | 3,378.4 | 0.24 |
+| Full Analysis Pipeline | 2 | 5,000 | 1.391 | **3,594.9** | 0.26 |
+| Full Analysis Pipeline | 4 | 5,000 | 1.471 | 3,399.4 | 0.24 |
 
 ### Throughput Observation
 
-Throughput peaks around **~3,805 pps** with 2 workers in the full pipeline (`~13,215 pps` for raw dissection alone). Adding 4 workers slightly lowers throughput (`3,605 pps`) because CPU-bound Python bytecode execution shares CPython's GIL alongside short locks in `StreamStore`, `FlowTracker`, and `HostProfiler`. While well above what normal web browsing and file downloads require without queue drops, sustained multi-gigabit line-rate capture would call for a compiled language (Rust/Go/C) or multiprocessing over raw bytes.
+Throughput peaks around **~3,595 pps** with 2 workers in the full pipeline (`~12,274 pps` for raw dissection alone). Adding 4 workers slightly lowers throughput (`3,399 pps`) because CPU-bound Python bytecode execution shares CPython's GIL alongside short locks in `StreamStore`, `FlowTracker`, and `HostProfiler`. While well above what normal web browsing and file downloads require without queue drops, sustained multi-gigabit line-rate capture would call for a compiled language (Rust/Go/C) or multiprocessing over raw bytes.
 
 ---
 
 ## Testing
 
-All 40 automated unit and integration tests run without Administrator rights using synthetic Scapy-crafted packets:
+All 43 automated unit and integration tests run without Administrator rights using synthetic Scapy-crafted packets:
 
 ```powershell
 # Run the full test suite
@@ -255,8 +260,8 @@ python benchmark.py --generate 5000
 - **Discovery Multicast & Background Chatter (`PORT_SWEEP` / `TTL_ANOMALY`):** `TTLRule` explicitly excludes multicast (`224.0.0.0/4`, `ff00::/8`) and link-local addresses so mDNS/SSDP `TTL=1` traffic does not alert. However, aggressive local service discovery or browser UDP traffic (e.g., QUIC/WebRTC opening many ephemeral ports) can trip low `--port-threshold` values.
 - **Encrypted DNS & TLS/QUIC Inspection Limits:** Passive inspection cannot decrypt **DNS over HTTPS (DoH)** or **DNS over TLS (DoT on port 853)** queries. Likewise, `tls_parser.py` extracts unencrypted `ClientHello` SNI/ALPN metadata over TCP (`443`/`8443`) and never attempts payload decryption; UDP-based QUIC Initial handshakes return `None` and are tracked as `UDP` with high Shannon entropy.
 - **Baseline Warmup (`HostProfiler`):** During `--baseline-seconds` (default `60s`), rate spikes are intentionally suppressed until sufficient per-second history (`min_history_seconds=5`) accumulates; a sudden burst within the first few seconds of capture will not trigger `STATISTICAL_ANOMALY`.
-- **Port-Based Application Dispatch:** HTTP/DNS/TLS sub-parsers trigger on standard port sets (`80/8080/3000/8000/8008`, `53/5353`, `443/8443`); HTTP running on unconventional ports will appear as raw `TCP` unless ports are customized.
-- **Advanced TCP Edge Cases:** `TCPReassembler` handles 32-bit sequence wraparound, out-of-order segments, retransmissions, and mid-stream prefix ordering, but does not interpret TCP SACK option blocks or TCP Fast Open data inside `SYN` frames.
+- **Port-Based Application Dispatch:** HTTP/DNS/TLS sub-parsers trigger on standard port sets (`80/8080/3000/8000/8008`, `53/5353`, `443/8443`); pass `--http-ports` to dissect HTTP on custom ports.
+- **Advanced TCP Edge Cases:** `TCPReassembler` handles 32-bit sequence wraparound, out-of-order segments, retransmissions, and multi-gap mid-stream prefix ordering, but does not interpret TCP SACK option blocks or TCP Fast Open data inside `SYN` frames.
 
 ---
 
@@ -270,7 +275,7 @@ python benchmark.py --generate 5000
 | Concurrency | Python `threading` + `queue.Queue` |
 | Passive OS Database | Local JSON (`fingerprint/db/fingerprints.json`) |
 | Flow Export | Versioned NetFlow-style JSON (`_schema_version: 1.0`) |
-| Testing | `pytest` (40 synthetic-packet tests) |
+| Testing | `pytest` (43 synthetic-packet tests) |
 | Language & Platform | Python 3.11+ on Windows 10/11 |
 
 ---

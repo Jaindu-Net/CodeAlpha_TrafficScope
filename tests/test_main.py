@@ -66,6 +66,28 @@ def test_main_offline_read_and_export_roundtrip(tmp_path: Path) -> None:
 def test_main_list_interfaces_and_missing_file_exit_codes(tmp_path: Path) -> None:
     assert main(["--iface", "?"]) == 0
     assert main(["--read", str(tmp_path / "missing.pcap")]) == 1
+    assert main(["--read", str(tmp_path / "missing.pcap"), "--http-ports", "badport"]) == 1
+
+
+def test_main_custom_http_ports_and_follow_streams(tmp_path: Path) -> None:
+    in_pcap = tmp_path / "http_8888.pcap"
+    pkts = [
+        make_http_request_pkt(dport=8888, seq=100, ack=200),
+        make_http_response_pkt(sport=8888, seq=200, ack=180, body=b"custom-port-ok"),
+    ]
+    wrpcap(str(in_pcap), pkts)
+
+    args = build_arg_parser().parse_args(
+        ["--read", str(in_pcap), "--http-ports", "8888", "--follow-streams", "--threads", "1"]
+    )
+    buf = StringIO()
+    summary = run_session(args, console=Console(file=buf, force_terminal=False, width=100))
+
+    assert len(summary["http_exchanges"]) == 1
+    output = buf.getvalue()
+    assert "Reconstructed HTTP Sessions" in output
+    assert "Follow TCP Stream" in output
+    assert "custom-port-ok" in output
 
 
 def test_analyzer_module_has_zero_forbidden_imports() -> None:

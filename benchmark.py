@@ -208,7 +208,7 @@ def main() -> None:
         pcap_path = Path(temp_dir.name) / "synthetic_benchmark.pcap"
         console.print(f"[cyan]Generating {args.generate:,} synthetic packets...[/cyan]")
         generate_benchmark_pcap(pcap_path, args.generate)
-        pcap_label = f"Synthetic Mixed PCAP ({args.generate:,} pkts)"
+        pcap_label = "Synthetic Mixed PCAP"
 
     try:
         packets = list(rdpcap(str(pcap_path)))
