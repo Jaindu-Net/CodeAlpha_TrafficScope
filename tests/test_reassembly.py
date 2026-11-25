@@ -144,6 +144,23 @@ def test_tcp_three_chunk_reverse_midstream_reassembly() -> None:
     assert reassembler.get_stream_data(s1.flow_key, direction="client") == b"PART1-PART2-PART3"
 
 
+def test_follow_stream_sanitizes_ansi_escape_and_control_bytes() -> None:
+    parser = PacketParser()
+    reassembler = TCPReassembler()
+
+    # Simulated binary/encrypted payload containing ANSI DA1 query ESC[c and bell \x07.
+    dirty = parser.parse(
+        make_tcp_segment(sport=54444, dport=443, seq=1, payload=b"\x1b[c\x07HELLO\x00\xff")
+    )
+    reassembler.add_segment(dirty)
+
+    conv = reassembler.follow_stream(dirty.flow_key)
+    assert "\x1b" not in conv
+    assert "\x07" not in conv
+    assert "\x00" not in conv
+    assert "HELLO" in conv
+
+
 def test_tcp_stream_idle_expiry() -> None:
     parser = PacketParser()
     store = StreamStore(idle_timeout_seconds=10.0)

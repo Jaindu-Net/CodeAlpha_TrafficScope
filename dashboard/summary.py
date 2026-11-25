@@ -7,6 +7,7 @@ from typing import Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from dashboard.widgets.top_talkers import format_bytes
 
@@ -154,14 +155,18 @@ def print_followed_streams(
     console: Console | None = None,
     *,
     max_streams: int = 10,
+    max_chars_per_stream: int = 1500,
 ) -> None:
-    """Render Wireshark-style Follow TCP Stream transcripts."""
+    """Render Wireshark-style Follow TCP Stream transcripts safely."""
     if not streams:
         return
     out = console or Console()
     for flow_key, transcript in streams[:max_streams]:
         title = f"Follow TCP Stream {flow_key}"
-        out.print(Panel(transcript, title=title, border_style="green"))
+        display_text = transcript
+        if len(display_text) > max_chars_per_stream:
+            display_text = display_text[:max_chars_per_stream] + "\n... [truncated]"
+        out.print(Panel(Text(display_text), title=title, border_style="green"))
 
 
 def print_exit_report(stats: dict[str, Any], console: Console | None = None) -> None:

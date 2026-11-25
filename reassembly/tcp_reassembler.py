@@ -370,19 +370,44 @@ class TCPReassembler:
         return exchanges
 
     def get_all_streams_text(self) -> list[tuple[FlowKey, str]]:
-        """Return formatted conversation strings for all non-empty streams."""
-        results: list[tuple[FlowKey, str]] = []
+        """Return sanitized conversation strings sorted with readable streams first."""
+        ranked: list[tuple[float, FlowKey, str]] = []
         for stream in self.store.all_streams():
-            if stream.conversation:
-                results.append((stream.flow_key, _format_conversation(stream.conversation)))
-        return results
+            if not stream.conversation:
+                continue
+            raw_total = sum(len(chunk) for _, chunk in stream.conversation)
+            printable = sum(
+                1
+                for _, chunk in stream.conversation
+                for b in chunk
+                if (32 <= b <= 126) or b in (9, 10, 13)
+            )
+            ratio = printable / raw_total if raw_total else 0.0
+            ranked.append((ratio, stream.flow_key, _format_conversation(stream.conversation)))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [(flow_key, text) for _, flow_key, text in ranked]
+
+
+def _sanitize_stream_bytes(chunk: bytes) -> str:
+    """Decode stream bytes safely, neutralizing control/ANSI escape sequences."""
+    decoded = chunk.decode("utf-8", errors="replace")
+    safe_chars: list[str] = []
+    for ch in decoded:
+        code = ord(ch)
+        if ch in ("\r", "\n", "\t"):
+            safe_chars.append(ch)
+        elif code < 32 or code == 127 or (128 <= code <= 159) or ch == "\ufffd":
+            safe_chars.append(".")
+        else:
+            safe_chars.append(ch)
+    return "".join(safe_chars)
 
 
 def _format_conversation(conversation: list[tuple[str, bytes]]) -> str:
-    """Format directional byte chunks into a readable transcript."""
+    """Format directional byte chunks into a terminal-safe readable transcript."""
     lines: list[str] = []
     for direction, chunk in conversation:
         prefix = "→ CLIENT" if direction == "CLIENT" else "← SERVER"
-        text = chunk.decode("utf-8", errors="replace")
-        lines.append(f"[{prefix}]\n{text}")
+        lines.append(f"[{prefix}]\n{_sanitize_stream_bytes(chunk)}")
     return "\n".join(lines)
